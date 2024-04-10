@@ -375,7 +375,7 @@ class TipBot:
 
     def get_wallet_balance(self):
         try:
-            r = self.wallet_api.listlelantusmints()
+            r = self.wallet_api.listsparkmints()
             result = sum([_x['amount'] for _x in r['result'] if not _x['isUsed']])
             print("Current Balance", result / 1e8)
         except Exception as exc:
@@ -386,166 +386,134 @@ class TipBot:
             Update user's balance using transactions history
         """
         print("Handle TXs")
+        # First get unused mints for the wallet, check if mint is confirmed in the tx list
+        unused_mints = []
+        mints = wallet_api.listsparkmints()
+        for mnt in mints['result']:
+            if not mnt['isUsed']:
+                unused_mints.append(mnt)
+
         response = self.wallet_api.get_txs_list()
 
-        for _tx in response['result']:
-            try:
-
-                if not _tx.get('address'):
-                    continue
-
-
-                """
-                    Check withdraw txs    
-                """
-                _user_receiver = self.col_users.find_one(
-                    {"Address": _tx['address']}
-                )
-                _is_tx_exist_deposit = self.col_txs.find_one(
-                    {"txId": _tx['txid'], "type": "deposit"}
-                ) is not None
-
-                if _user_receiver is not None and \
-                        not _is_tx_exist_deposit and \
-                        _tx['confirmations'] >= 2 and _tx['category'] == 'receive':
-
-                    value_in_coins = float(_tx['amount'])
-                    new_balance = _user_receiver['Balance'] + value_in_coins
-
-                    _id = str(uuid.uuid4())
-                    self.col_txs.insert_one({
-                        '_id': _id,
-                        'txId': _tx['txid'],
-                        **_tx,
-                        'type': "deposit",
-                        'timestamp': datetime.datetime.now()
-                    })
-                    self.col_users.update_one(
-                        _user_receiver,
-                        {
-                            "$set":
-                                {
-                                    "Balance": float("{0:.8f}".format(float(new_balance)))
-                                }
-                        }
-                    )
-                    self.create_receive_tips_image(
-                        _user_receiver['_id'],
-                        "{0:.8f}".format(value_in_coins),
-                        "Deposit")
-
-                    print("*Deposit Success*\n"
-                          "Balance of address %s has recharged on *%s* firos." % (
-                              _tx['address'], value_in_coins
-                          ))
-                    continue
-
-                _is_tx_exist_withdraw = self.col_txs.find_one(
-                    {"txId": _tx['txid'], "type": "withdraw"}
-                ) is not None
-
-                pending_sender = self.col_senders.find_one(
-                    {"txId": _tx['txid'], "status": "pending"}
-                )
-                if not pending_sender:
-                    continue
-                _user_sender = self.col_users.find_one({"_id": pending_sender['user_id']})
-                if _user_sender is not None and not _is_tx_exist_withdraw and _tx['category'] == "spend":
-
-                    value_in_coins = float((abs(_tx['amount'])))
-
-                    # if _tx['status'] == 4 or _tx['status'] == 2:
-                    #     self.withdraw_failed_image(_user_sender['_id'])
-                    #     try:
-                    #         reason = _tx['failure_reason']
-                    #     except Exception:
-                    #         reason = "cancelled"
-                    #     self.col_txs.insert({
-                    #         "txId": _tx['txid'],
-                    #         'kernel': '000000000000000000',
-                    #         'receiver': _tx['receiver'],
-                    #         'sender': _tx['sender'],
-                    #         'status': _tx['status'],
-                    #         'fee': _tx['fee'],
-                    #         'reason': reason,
-                    #         'comment': _tx['comment'],
-                    #         'value': _tx['value'],
-                    #         'type': "withdraw",
-                    #         'timestamp': datetime.datetime.now()
-                    #     })
-                    #
-                    #     new_locked = float(_user_sender['Locked']) - value_in_coins
-                    #     new_balance = float(_user_sender['Balance']) + value_in_coins
-                    #
-                    #     self.col_users.update_one(
-                    #         {
-                    #             "_id": _user_sender['_id']
-                    #         },
-                    #         {
-                    #             "$set":
-                    #                 {
-                    #                     "IsWithdraw": False,
-                    #                     "Balance": float("{0:.8f}".format(float(new_balance))),
-                    #                     "Locked": float("{0:.8f}".format(float(new_locked)))
-                    #                 }
-                    #         }
-                    #     )
-
-                    if _tx['confirmations'] >= 2:
-                        _id = str(uuid.uuid4())
-                        self.col_txs.insert_one({
-                            '_id': _id,
-                            "txId": _tx['txid'],
-                            **_tx,
-                            'type': "withdraw",
-                            'timestamp': datetime.datetime.now()
-                        })
-                        new_locked = float(_user_sender['Locked']) - value_in_coins
-                        if new_locked >= 0:
-                            self.col_users.update_one(
-                                {
-                                    "_id": _user_sender['_id']
-                                },
-                                {
-                                    "$set":
-                                        {
-                                            "Locked": float("{0:.8f}".format(new_locked)),
-                                            "IsWithdraw": False
-                                        }
-                                }
-                            )
-                        else:
-                            new_balance = float(_user_sender['Balance']) - value_in_coins
-                            self.col_users.update_one(
-                                {
-                                    "_id": _user_sender['_id']
-                                },
-                                {
-                                    "$set":
-                                        {
-                                            "Balance": float("{0:.8f}".format(new_balance)),
-                                            "IsWithdraw": False
-                                        }
-                                }
-                            )
-
-                        self.create_send_tips_image(_user_sender['_id'],
-                                                    "{0:.8f}".format(float(abs(_tx['amount']))),
-                                                    "%s..." % _tx['address'][:8])
-
-                        self.col_senders.update_one(
-                            {"txId": _tx['txid'], "status": "pending", "user_id": _user_sender['_id']},
-                            {"$set": {"status": "completed"}}
+        for unused_mnt in unused_mints:
+            for _tx in response['result']:
+                try:
+                    if unused_mnt['txid'] == _tx['txid']:
+                        """
+                            Check withdraw txs    
+                        """
+                        wallet_address = wallet_api.create_user_wallet()
+                        _user_receiver = self.col_users.find_one(
+                            {"Address": wallet_address[0]}
                         )
-                        print("*Withdrawal Success*\n"
-                              "Balance of address %s has recharged on *%s* firos." % (
-                                  _user_sender['Address'], value_in_coins
-                              ))
-                        continue
+                        _is_tx_exist_deposit = self.col_txs.find_one(
+                            {"txId": _tx['txid'], "type": "deposit"}
+                        ) is not None
 
-            except Exception as exc:
-                print(exc)
-                traceback.print_exc()
+                        if _user_receiver is not None and \
+                                not _is_tx_exist_deposit and \
+                                _tx['confirmations'] >= 2 and _tx['category'] == 'receive':
+
+                            value_in_coins = float(_tx['amount'])
+                            new_balance = _user_receiver['Balance'] + value_in_coins
+
+                            _id = str(uuid.uuid4())
+                            self.col_txs.insert_one({
+                                '_id': _id,
+                                'txId': _tx['txid'],
+                                **_tx,
+                                'type': "deposit",
+                                'timestamp': datetime.datetime.now()
+                            })
+                            self.col_users.update_one(
+                                _user_receiver,
+                                {
+                                    "$set":
+                                        {
+                                            "Balance": float("{0:.8f}".format(float(new_balance)))
+                                        }
+                                }
+                            )
+                            self.create_receive_tips_image(
+                                _user_receiver['_id'],
+                                "{0:.8f}".format(value_in_coins),
+                                "Deposit")
+
+                            print("*Deposit Success*\n"
+                                  "Balance of address %s has recharged on *%s* firos." % (
+                                      wallet_address[0], value_in_coins
+                                  ))
+                            continue
+
+                        _is_tx_exist_withdraw = self.col_txs.find_one(
+                            {"txId": _tx['txid'], "type": "withdraw"}
+                        ) is not None
+
+                        pending_sender = self.col_senders.find_one(
+                            {"txId": _tx['txid'], "status": "pending"}
+                        )
+                        if not pending_sender:
+                            continue
+                        _user_sender = self.col_users.find_one({"_id": pending_sender['user_id']})
+                        if _user_sender is not None and not _is_tx_exist_withdraw and _tx['category'] == "spend":
+
+                            value_in_coins = float((abs(_tx['amount'])))
+
+                            if _tx['confirmations'] >= 2:
+                                _id = str(uuid.uuid4())
+                                self.col_txs.insert_one({
+                                    '_id': _id,
+                                    "txId": _tx['txid'],
+                                    **_tx,
+                                    'type': "withdraw",
+                                    'timestamp': datetime.datetime.now()
+                                })
+                                new_locked = float(_user_sender['Locked']) - value_in_coins
+                                if new_locked >= 0:
+                                    self.col_users.update_one(
+                                        {
+                                            "_id": _user_sender['_id']
+                                        },
+                                        {
+                                            "$set":
+                                                {
+                                                    "Locked": float("{0:.8f}".format(new_locked)),
+                                                    "IsWithdraw": False
+                                                }
+                                        }
+                                    )
+                                else:
+                                    new_balance = float(_user_sender['Balance']) - value_in_coins
+                                    self.col_users.update_one(
+                                        {
+                                            "_id": _user_sender['_id']
+                                        },
+                                        {
+                                            "$set":
+                                                {
+                                                    "Balance": float("{0:.8f}".format(new_balance)),
+                                                    "IsWithdraw": False
+                                                }
+                                        }
+                                    )
+
+                                self.create_send_tips_image(_user_sender['_id'],
+                                                            "{0:.8f}".format(float(abs(_tx['amount']))),
+                                                            "%s..." % wallet_address[0][:8])
+
+                                self.col_senders.update_one(
+                                    {"txId": _tx['txid'], "status": "pending", "user_id": _user_sender['_id']},
+                                    {"$set": {"status": "completed"}}
+                                )
+                                print("*Withdrawal Success*\n"
+                                      "Balance of address %s has recharged on *%s* firos." % (
+                                          _user_sender['Address'], value_in_coins
+                                      ))
+                                continue
+
+                except Exception as exc:
+                    print(exc)
+                    traceback.print_exc()
 
     def get_user_data(self):
         """
@@ -553,11 +521,31 @@ class TipBot:
         """
         try:
             _user = self.col_users.find_one({"_id": self.user_id})
+            self.update_address_and_balance(_user)
             return _user['Address'], _user['Balance'], _user['Locked'], _user['IsWithdraw']
         except Exception as exc:
             print(exc)
             traceback.print_exc()
             return None, None, None, None
+
+    def update_address_and_balance(self, _user):
+        mints = wallet_api.listsparkmints()
+        if len(mints) > 0:
+            # Check if User has a Lelantus address
+            valid = wallet_api.validate_address(_user['Address'])['result']
+            is_valid_firo = 'isvalid'
+            # User still has Lelantus address, Update address and balance
+            if is_valid_firo in valid:
+                spark_address = wallet_api.create_user_wallet()
+                self.col_users.update_one(
+                    _user,
+                    {
+                        "$set":
+                            {
+                                "Address": spark_address[0],
+                            }
+                    }
+                )
 
     def withdraw_coins(self, address, amount, comment=""):
         """
@@ -577,7 +565,13 @@ class TipBot:
                 traceback.print_exc()
                 return
 
-            _is_address_valid = self.wallet_api.validate_address(address)['result']['isvalid']
+            _is_address_valid = False
+            validate = self.wallet_api.validate_address(address)['result']
+            is_valid_spark = 'isvalidSpark'
+            is_valid_firo = 'isvalid'
+            if is_valid_spark in validate or is_valid_firo in validate:
+                _is_address_valid = True
+
             if not _is_address_valid:
                 self.send_message(
                     self.user_id,
@@ -592,9 +586,10 @@ class TipBot:
 
                 new_balance = float("{0:.8f}".format(float(self.balance_in_firo - amount)))
                 new_locked = float("{0:.8f}".format(float(self.locked_in_firo + amount - AV_FEE)))
-                response = self.wallet_api.joinsplit(
+                response = self.wallet_api.spendspark(
                     address,
-                    float(amount - AV_FEE),  # fee
+                    float(amount),
+                    comment
                 )
                 print(response, "withdraw")
                 if response.get('error'):
