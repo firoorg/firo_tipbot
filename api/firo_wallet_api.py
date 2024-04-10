@@ -43,16 +43,6 @@ class FiroWalletAPI:
         print(response)
         return response
 
-    # TODO - REMOVE
-    def listlelantusmints(self):
-        response = requests.post(
-            self.httpprovider,
-            data=json.dumps(
-                {"jsonrpc": "1.0", "id": 2, "method": "listlelantusmints"}
-            )).json()
-
-        return response
-
     """
         Get wallet status
     """
@@ -124,7 +114,7 @@ class FiroWalletAPI:
                     "method": "spendspark",
                     "params": [
                         {
-                            address: {"amount": value, "memo": memo, "subtractFee": False}
+                            address: {"amount": value, "memo": memo, "subtractFee": True}
                         }
                     ]
 
@@ -156,20 +146,6 @@ class FiroWalletAPI:
         Send Transaction 
     """
 
-    # def joinsplit(self, address, value):
-    #     response = requests.post(
-    #         self.httpprovider,
-    #         data=json.dumps(
-    #             {
-    #                 "jsonrpc": "1.0",
-    #                 "id": 4,
-    #                 "method": "joinsplit",
-    #                 "params": [{address: value}]
-    #             })).json()
-    #
-    #     print(response)
-    #     return response
-
     """ 
     """
 
@@ -184,18 +160,7 @@ class FiroWalletAPI:
                 })).json()
         print(response)
         return response
-    # def listlelantusjoinsplits(self):
-    #     response = requests.post(
-    #         self.httpprovider,
-    #         data=json.dumps(
-    #             {
-    #                 "jsonrpc": "1.0",
-    #                 "id": 4,
-    #                 "method": "listlelantusjoinsplits",
-    #                 "params": [100]
-    #             })).json()
-    #     print(response)
-    #     return response
+
 
     """
     """

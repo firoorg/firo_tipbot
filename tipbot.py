@@ -386,7 +386,6 @@ class TipBot:
             Update user's balance using transactions history
         """
         print("Handle TXs")
-
         # First get unused mints for the wallet, check if mint is confirmed in the tx list
         unused_mints = []
         mints = wallet_api.listsparkmints()
@@ -522,12 +521,31 @@ class TipBot:
         """
         try:
             _user = self.col_users.find_one({"_id": self.user_id})
-            print(f'USER IS {_user}')
+            self.update_address_and_balance(_user)
             return _user['Address'], _user['Balance'], _user['Locked'], _user['IsWithdraw']
         except Exception as exc:
             print(exc)
             traceback.print_exc()
             return None, None, None, None
+
+    def update_address_and_balance(self, _user):
+        mints = wallet_api.listsparkmints()
+        if len(mints) > 0:
+            # Check if User has a Lelantus address
+            valid = wallet_api.validate_address(_user['Address'])['result']
+            is_valid_firo = 'isvalid'
+            # User still has Lelantus address, Update address and balance
+            if is_valid_firo in valid:
+                spark_address = wallet_api.create_user_wallet()
+                self.col_users.update_one(
+                    _user,
+                    {
+                        "$set":
+                            {
+                                "Address": spark_address[0],
+                            }
+                    }
+                )
 
     def withdraw_coins(self, address, amount, comment=""):
         """
