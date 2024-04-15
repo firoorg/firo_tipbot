@@ -202,7 +202,6 @@ class TipBot:
         """
             Check each user actions
         """
-
         # ***** Tip bot section begin *****
         if cmd.startswith("/tip") or cmd.startswith("/atip"):
             if not self._is_user_in_db:
@@ -389,14 +388,14 @@ class TipBot:
         # First get unused mints for the wallet, check if mint is confirmed in the tx list
         unused_mints = []
         mints = wallet_api.listsparkmints()
+
         for mnt in mints['result']:
             if not mnt['isUsed']:
                 unused_mints.append(mnt)
-
         response = self.wallet_api.get_txs_list()
 
-        for unused_mnt in unused_mints:
-            for _tx in response['result']:
+        for _tx in response['result']:
+            for unused_mnt in unused_mints:
                 try:
                     if unused_mnt['txid'] == _tx['txid']:
                         """
@@ -409,14 +408,12 @@ class TipBot:
                         _is_tx_exist_deposit = self.col_txs.find_one(
                             {"txId": _tx['txid'], "type": "deposit"}
                         ) is not None
-
                         if _user_receiver is not None and \
                                 not _is_tx_exist_deposit and \
                                 _tx['confirmations'] >= 2 and _tx['category'] == 'receive':
 
                             value_in_coins = float(_tx['amount'])
                             new_balance = _user_receiver['Balance'] + value_in_coins
-
                             _id = str(uuid.uuid4())
                             self.col_txs.insert_one({
                                 '_id': _id,
@@ -532,7 +529,7 @@ class TipBot:
         mints = wallet_api.listsparkmints()
         if len(mints) > 0:
             # Check if User has a Lelantus address
-            valid = wallet_api.validate_address(_user['Address'])['result']
+            valid = wallet_api.validate_address(_user['Address'][0])['result']
             is_valid_firo = 'isvalid'
             # User still has Lelantus address, Update address and balance
             if is_valid_firo in valid:
