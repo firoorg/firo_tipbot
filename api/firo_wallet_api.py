@@ -20,6 +20,9 @@ class FiroWalletAPI:
             )).json()
         return response['result']
 
+    """
+        Get default spark address for wallet
+    """
     def get_default_address(self):
         response = requests.post(
             self.httpprovider,
@@ -29,6 +32,9 @@ class FiroWalletAPI:
         print(response)
         return response['result']
 
+    """
+        Get txHash Spark address memo, and amount if the transaction is to you 
+    """
     def get_spark_coin_address(self, tx_hash):
         response = requests.post(
             self.httpprovider,
@@ -101,6 +107,7 @@ class FiroWalletAPI:
         return response
 
     """ 
+        Mint Spark
     """
 
     def automintunspent(self):
@@ -117,8 +124,8 @@ class FiroWalletAPI:
         return response
 
     """
-            Sends privately if to a Spark address, or deshields if to a transparent address.
-        """
+        Sends privately if to a Spark address, or deshields if to a transparent address.
+    """
 
     def spendspark(self, address, value, memo=""):
         response = requests.post(
