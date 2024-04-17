@@ -11,13 +11,13 @@ class FiroWalletAPI:
     """
         Create new wallet for new bot member
     """
+
     def create_user_wallet(self):
         response = requests.post(
             self.httpprovider,
             data=json.dumps(
                 {"jsonrpc": "1.0", "id": 1, "method": "getnewsparkaddress"}
             )).json()
-        print(response)
         return response['result']
 
     def get_default_address(self):
@@ -27,6 +27,15 @@ class FiroWalletAPI:
                 {"jsonrpc": "1.0", "id": 1, "method": "getsparkdefaultaddress"}
             )).json()
         print(response)
+        return response['result']
+
+    def get_spark_coin_address(self, tx_hash):
+        response = requests.post(
+            self.httpprovider,
+            data=json.dumps(
+                {"jsonrpc": "1.0", "id": 1, "method": "getsparkcoinaddr", "params":
+                    [tx_hash]}
+            )).json()
         return response['result']
 
     """
@@ -48,7 +57,6 @@ class FiroWalletAPI:
             data=json.dumps(
                 {"jsonrpc": "1.0", "id": 2, "method": "listsparkmints"}
             )).json()
-        print(response)
         return response
 
     """
@@ -168,7 +176,6 @@ class FiroWalletAPI:
                 })).json()
         print(response)
         return response
-
 
     """
     """

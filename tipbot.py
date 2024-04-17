@@ -15,7 +15,6 @@ from PIL import Image, ImageFont, ImageDraw
 import matplotlib.pyplot as plt
 import datetime
 import time
-import requests
 from pymongo import MongoClient
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 import uuid
@@ -73,7 +72,7 @@ class TipBot:
             self.first_name, self.username, self.user_id, self.firo_address, \
             self.balance_in_firo, self.locked_in_firo, self.is_withdraw, self.balance_in_groth, \
             self._is_verified, self.group_id, self.group_username = \
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+            None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
         self.wallet_api.automintunspent()
         schedule.every(60).seconds.do(self.update_balance)
@@ -152,7 +151,6 @@ class TipBot:
         except Exception as exc:
             print(exc)
 
-
     def get_group_username(self):
         """
             Get group username
@@ -161,7 +159,6 @@ class TipBot:
             return str(self.message.chat.username)
         except Exception:
             return str(self.message.chat.id)
-
 
     def get_user_username(self):
         """
@@ -197,7 +194,6 @@ class TipBot:
 
         return str(menu_option), _is_document
 
-
     def action_processing(self, cmd, args):
         """
             Check each user actions
@@ -205,7 +201,9 @@ class TipBot:
         # ***** Tip bot section begin *****
         if cmd.startswith("/tip") or cmd.startswith("/atip"):
             if not self._is_user_in_db:
-                self.send_message(self.group_id, f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1"><a href="https://t.me/firo_tipbot?start=1">start the bot</a></a>to receive tips!', parse_mode='HTML')
+                self.send_message(self.group_id,
+                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1"><a href="https://t.me/firo_tipbot?start=1">start the bot</a></a>to receive tips!',
+                                  parse_mode='HTML')
                 return
             try:
                 if args is not None and len(args) >= 1:
@@ -244,7 +242,7 @@ class TipBot:
                 self.bot.delete_message(self.group_id, self.message.message_id)
             except Exception:
                 pass
-            
+
             if self.message.chat['type'] == 'private':
                 self.send_message(
                     self.user_id,
@@ -255,7 +253,8 @@ class TipBot:
 
             if not self._is_user_in_db:
                 self.send_message(self.group_id,
-                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!', parse_mode="HTML", disable_web_page_preview=True)
+                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!',
+                                  parse_mode="HTML", disable_web_page_preview=True)
                 return
 
             try:
@@ -271,7 +270,8 @@ class TipBot:
         elif cmd.startswith("catch_envelope|"):
             if not self._is_user_in_db:
                 self.send_message(self.group_id,
-                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!', parse_mode="HTML", disable_web_page_preview=True)
+                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!',
+                                  parse_mode="HTML", disable_web_page_preview=True)
                 return
 
             try:
@@ -286,7 +286,8 @@ class TipBot:
         elif cmd.startswith("/balance"):
             if not self._is_user_in_db:
                 self.send_message(self.group_id,
-                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!', parse_mode="HTML", disable_web_page_preview=True)
+                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!',
+                                  parse_mode="HTML", disable_web_page_preview=True)
                 return
             self.send_message(
                 self.user_id,
@@ -298,7 +299,8 @@ class TipBot:
             try:
                 if not self._is_user_in_db:
                     self.send_message(self.group_id,
-                                      f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!', parse_mode="HTML", disable_web_page_preview=True)
+                                      f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!',
+                                      parse_mode="HTML", disable_web_page_preview=True)
                     return
                 if args is not None and len(args) == 2:
                     self.withdraw_coins(*args)
@@ -311,11 +313,12 @@ class TipBot:
         elif cmd.startswith("/deposit"):
             if not self._is_user_in_db:
                 self.send_message(self.group_id,
-                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!', parse_mode="HTML", disable_web_page_preview=True)
+                                  f'<a href="tg://user?id={self.user_id}">{self.first_name}</a>, <a href="https://t.me/firo_tipbot?start=1">start the bot</a> to receive tips!',
+                                  parse_mode="HTML", disable_web_page_preview=True)
                 return
             self.send_message(
                 self.user_id,
-                dictionary['deposit'] % self.firo_address,
+                dictionary['deposit'] % self.firo_address[0],
                 parse_mode='HTML'
             )
             self.create_qr_code()
@@ -332,8 +335,6 @@ class TipBot:
         # ***** Verification section begin *****
         elif cmd.startswith("/start"):
             self.auth_user()
-
-
 
     def check_username_on_change(self):
         """
@@ -371,7 +372,6 @@ class TipBot:
                 }
             )
 
-
     def get_wallet_balance(self):
         try:
             r = self.wallet_api.listsparkmints()
@@ -401,10 +401,11 @@ class TipBot:
                         """
                             Check withdraw txs    
                         """
-                        wallet_address = wallet_api.create_user_wallet()
+                        sparkcoin_addr = wallet_api.get_spark_coin_address(unused_mnt['txid'])
                         _user_receiver = self.col_users.find_one(
-                            {"Address": wallet_address[0]}
+                            {"Address": sparkcoin_addr[0]['address']}
                         )
+
                         _is_tx_exist_deposit = self.col_txs.find_one(
                             {"txId": _tx['txid'], "type": "deposit"}
                         ) is not None
@@ -438,7 +439,7 @@ class TipBot:
 
                             print("*Deposit Success*\n"
                                   "Balance of address %s has recharged on *%s* firos." % (
-                                      wallet_address[0], value_in_coins
+                                      sparkcoin_addr[0]['address'], value_in_coins
                                   ))
                             continue
 
@@ -496,7 +497,7 @@ class TipBot:
 
                                 self.create_send_tips_image(_user_sender['_id'],
                                                             "{0:.8f}".format(float(abs(_tx['amount']))),
-                                                            "%s..." % wallet_address[0][:8])
+                                                            "%s..." % _user_sender['Address'][0][:8])
 
                                 self.col_senders.update_one(
                                     {"txId": _tx['txid'], "status": "pending", "user_id": _user_sender['_id']},
@@ -556,8 +557,8 @@ class TipBot:
                 amount = float(amount)
             except Exception as exc:
                 self.send_message(self.user_id,
-                                      dictionary['incorrect_amount'],
-                                      parse_mode='HTML')
+                                  dictionary['incorrect_amount'],
+                                  parse_mode='HTML')
                 print(exc)
                 traceback.print_exc()
                 return
@@ -647,8 +648,8 @@ class TipBot:
 
             if not _is_username_exists:
                 self.send_message(self.user_id,
-                                      dictionary['username_error'],
-                                      parse_mode='HTML')
+                                  dictionary['username_error'],
+                                  parse_mode='HTML')
                 return
 
             self.send_tip(_user['_id'], amount, _type, comment)
@@ -656,7 +657,6 @@ class TipBot:
         except Exception as exc:
             print(exc)
             traceback.print_exc()
-
 
     def tip_in_the_chat(self, amount, comment="", _type=None):
         """
@@ -684,7 +684,6 @@ class TipBot:
             print(exc)
             traceback.print_exc()
 
-
     def send_tip(self, user_id, amount, _type, comment):
         """
             Send tip to user with params
@@ -705,8 +704,8 @@ class TipBot:
 
             if _user_receiver is None or _user_receiver['IsVerified'] is False:
                 self.send_message(self.user_id,
-                                      dictionary['username_error'],
-                                      parse_mode='HTML')
+                                  dictionary['username_error'],
+                                  parse_mode='HTML')
                 return
 
             if _type == 'anonymous':
@@ -788,7 +787,6 @@ class TipBot:
             print(exc)
             traceback.print_exc()
 
-
     def create_receive_tips_image(self, user_id, amount, first_name, comment=""):
         try:
             im = Image.open("images/receive_template.png")
@@ -828,8 +826,8 @@ class TipBot:
                 print(exc)
                 if 'blocked' in str(exc):
                     self.send_message(self.group_id,
-                                          "<a href='tg://user?id=%s'>User</a> <b>needs to unblock the bot in order to check their balance!</b>" % user_id,
-                                          parse_mode='HTML')
+                                      "<a href='tg://user?id=%s'>User</a> <b>needs to unblock the bot in order to check their balance!</b>" % user_id,
+                                      parse_mode='HTML')
                 traceback.print_exc()
             except Exception as exc:
                 print(exc)
@@ -864,8 +862,8 @@ class TipBot:
                 print(exc)
                 if 'blocked' in str(exc):
                     self.send_message(self.group_id,
-                                          "<a href='tg://user?id=%s'>User</a> <b>needs to unblock the bot in order to check their balance!</b>" % user_id,
-                                          parse_mode='HTML')
+                                      "<a href='tg://user?id=%s'>User</a> <b>needs to unblock the bot in order to check their balance!</b>" % user_id,
+                                      parse_mode='HTML')
                 traceback.print_exc()
             except Exception as exc:
                 print(exc)
@@ -1295,10 +1293,9 @@ class TipBot:
             print(exc)
             traceback.print_exc()
 
-
     def create_qr_code(self):
         try:
-            url = pyqrcode.create(self.firo_address)
+            url = pyqrcode.create(self.firo_address[0])
             url.png('qrcode.png', scale=6, module_color="#000000",
                     background="#d8e4ee")
             time.sleep(0.5)
