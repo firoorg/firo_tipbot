@@ -32,7 +32,7 @@ class AddressFix:
                 {
                     "$set":
                         {
-                            "Address": new_address[0],
+                            "Address": new_address,
                         }
                 }
             )
