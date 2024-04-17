@@ -16,7 +16,7 @@ class FiroWalletAPI:
         response = requests.post(
             self.httpprovider,
             data=json.dumps(
-                {"jsonrpc": "1.0", "id": 1, "method": "getsparkdefaultaddress"}
+                {"jsonrpc": "1.0", "id": 1, "method": "getnewsparkaddress"}
             )).json()
         print(response)
         return response['result']
