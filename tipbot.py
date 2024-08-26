@@ -1,7 +1,6 @@
 """
-    Developed by @vsnation(t.me/vsnation)
-    Email: vsnation.v@gmail.com
-    If you'll need the support use the contacts ^(above)!
+Created by @vsnation(t.me/vsnation) vsnation.v@gmail.com
+Updated for use with Firo by Likho Jiba (likho) and Joshua Babb (sneurlax@gmail.com).
 """
 import json
 import logging
@@ -53,10 +52,10 @@ WELCOME_MESSAGE = """
 
 class TipBot:
     def __init__(self, wallet_api):
-        # INIT
+        # INIT.
         self.bot = Bot(bot_token)
         self.wallet_api = wallet_api
-        # firo Butler Initialization
+        # Firo Butler Initialization.
         client = MongoClient(connectionString)
         db = client.get_default_database()
         self.col_captcha = db['captcha']
@@ -85,7 +84,7 @@ class TipBot:
         while True:
             try:
                 self._is_user_in_db = None
-                # get chat updates
+                # Get chat updates.
                 new_messages = self.wait_new_message()
                 self.processing_messages(new_messages)
             except Exception as exc:
@@ -105,7 +104,7 @@ class TipBot:
                     else self.new_message.callback_query.message
                 self.text, self._is_video = self.get_action(self.new_message)
                 self.message_text = str(self.text).lower()
-                # init user data
+                # Init user data.
                 self.first_name = self.new_message.effective_user.first_name
                 self.username = self.new_message.effective_user.username
                 self.user_id = int(self.new_message.effective_user.id)
@@ -134,7 +133,7 @@ class TipBot:
                 else:
                     args = None
 
-                # Check if user changed his username
+                # Check if user changed his username.
                 self.check_username_on_change()
                 self.action_processing(str(split[0]).lower(), args)
                 # self.check_group_msg()
@@ -154,7 +153,7 @@ class TipBot:
 
     def get_group_username(self):
         """
-            Get group username
+        Get group username
         """
         try:
             return str(self.message.chat.username)
@@ -163,7 +162,7 @@ class TipBot:
 
     def get_user_username(self):
         """
-                Get User username
+        Get User username
         """
         try:
             return str(self.message.from_user.username)
@@ -197,7 +196,7 @@ class TipBot:
 
     def action_processing(self, cmd, args):
         """
-            Check each user actions
+        Check each user actions
         """
         # ***** Tip bot section begin *****
         if cmd.startswith("/tip") or cmd.startswith("/atip"):
@@ -339,7 +338,7 @@ class TipBot:
 
     def check_username_on_change(self):
         """
-            Check username on change in the bot
+        Check username on change in the bot
         """
         _is_username_in_db = self.col_users.find_one(
             {"username": self.username}) is not None \
@@ -383,10 +382,10 @@ class TipBot:
 
     def update_balance(self):
         """
-            Update user's balance using transactions history
+        Update user's balance using transactions history
         """
         print("Handle TXs")
-        # First get unused mints for the wallet, check if mint is confirmed in the tx list
+        # First get unused mints for the wallet, check if mint is confirmed in the tx list.
         unused_mints = []
         mints = wallet_api.listsparkmints()
 
@@ -507,7 +506,7 @@ class TipBot:
 
     def get_user_data(self):
         """
-            Get user data
+        Get user data
         """
         try:
             _user = self.col_users.find_one({"_id": self.user_id})
@@ -521,10 +520,10 @@ class TipBot:
     def update_address_and_balance(self, _user):
         mints = wallet_api.listsparkmints()
         if len(mints) > 0:
-            # Check if User has a Lelantus address
+            # Check if User has a Lelantus address.
             valid = wallet_api.validate_address(_user['Address'][0])['result']
             is_valid_firo = 'isvalid'
-            # User still has Lelantus address, Update address and balance
+            # User still has Lelantus address, Update address and balance.
             if is_valid_firo in valid:
                 spark_address = wallet_api.create_user_wallet()
                 self.col_users.update_one(
@@ -552,7 +551,7 @@ class TipBot:
                 self.send_message(self.user_id, "<b>You specified an incorrect address</b>", parse_mode='HTML')
                 return
 
-            # Atomic operation to lock the user's balance and update it
+            # Atomic operation to lock the user's balance and update it.
             with client.start_session() as session:
                 with session.start_transaction():
                     user = self.col_users.find_one_and_update(
@@ -565,10 +564,10 @@ class TipBot:
                         self.insufficient_balance_image()
                         return
 
-                    # Proceed with the withdrawal
+                    # Proceed with the withdrawal.
                     response = self.wallet_api.spendspark(address, amount, comment)
                     if response.get('error'):
-                        # Rollback if spend failed
+                        # Rollback if spend failed.
                         self.col_users.update_one(
                             {"_id": self.user_id},
                             {"$inc": {"Balance": amount, "Locked": -(amount + AV_FEE)}},
@@ -578,7 +577,7 @@ class TipBot:
                         self.send_to_logs(f"Unavailable Withdraw\n{str(response)}")
                         return
 
-                    # Insert the transaction into the senders collection
+                    # Insert the transaction into the senders collection.
                     self.col_senders.insert_one(
                         {"txId": response['result'], "status": "pending", "user_id": self.user_id},
                         session=session
@@ -591,9 +590,9 @@ class TipBot:
 
     def tip_user(self, username, amount, comment, _type=None):
         """
-            Tip user with params:
-            username
-            amount
+        Tip user with params:
+        username
+        amount
         """
         try:
             try:
@@ -625,7 +624,7 @@ class TipBot:
 
     def tip_in_the_chat(self, amount, comment="", _type=None):
         """
-            Send a tip to user in the chat
+        Send a tip to user in the chat
         """
         try:
             try:
@@ -651,10 +650,9 @@ class TipBot:
 
     def send_tip(self, user_id, amount, _type, comment):
         """
-            Send tip to user with params
-            user_id - user identificator
-            addrees - user address
-            amount - amount of a tip
+        Send tip to user with params
+        user_id - user identifier
+        amount - amount of a tip
         """
         try:
             if self.user_id == user_id:
@@ -679,14 +677,14 @@ class TipBot:
                         self.insufficient_balance_image()
                         return
 
-                    # Update receiver's balance
+                    # Update receiver's balance.
                     self.col_users.update_one(
                         {"_id": user_id},
                         {"$inc": {"Balance": amount}},
                         session=session
                     )
 
-                    # Log the tip
+                    # Log the tip.
                     tip_log = {
                         "type": "atip" if _type == "anonymous" else "tip",
                         "from_user_id": self.user_id,
@@ -695,7 +693,7 @@ class TipBot:
                     }
                     self.col_tip_logs.insert_one(tip_log, session=session)
 
-                    # Create images
+                    # Create images.
                     self.create_send_tips_image(self.user_id, "{0:.8f}".format(amount), _user_receiver['first_name'], comment)
                     self.create_receive_tips_image(user_id, "{0:.8f}".format(amount), str(_type).title() if _type else self.first_name, comment)
 
