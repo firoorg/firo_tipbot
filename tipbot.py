@@ -19,6 +19,7 @@ from pymongo import MongoClient
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 import uuid
 from api.firo_wallet_api import FiroWalletAPI
+from pymongo import ReturnDocument
 
 plt.style.use('seaborn-whitegrid')
 
@@ -398,116 +399,107 @@ class TipBot:
             for unused_mnt in unused_mints:
                 try:
                     if unused_mnt['txid'] == _tx['txid']:
-                        """
-                            Check withdraw txs    
-                        """
-                        sparkcoin_addr = wallet_api.get_spark_coin_address(unused_mnt['txid'])
-                        _user_receiver = self.col_users.find_one(
-                            {"Address": sparkcoin_addr[0]['address']}
-                        )
-
-                        _is_tx_exist_deposit = self.col_txs.find_one(
-                            {"txId": _tx['txid'], "type": "deposit"}
-                        ) is not None
-                        if _user_receiver is not None and \
-                                not _is_tx_exist_deposit and \
-                                _tx['confirmations'] >= 2 and _tx['category'] == 'receive':
-
-                            value_in_coins = float(_tx['amount'])
-                            new_balance = _user_receiver['Balance'] + value_in_coins
-                            _id = str(uuid.uuid4())
-                            self.col_txs.insert_one({
-                                '_id': _id,
-                                'txId': _tx['txid'],
-                                **_tx,
-                                'type': "deposit",
-                                'timestamp': datetime.datetime.now()
-                            })
-                            self.col_users.update_one(
-                                _user_receiver,
-                                {
-                                    "$set":
-                                        {
-                                            "Balance": float("{0:.8f}".format(float(new_balance)))
-                                        }
-                                }
-                            )
-                            self.create_receive_tips_image(
-                                _user_receiver['_id'],
-                                "{0:.8f}".format(value_in_coins),
-                                "Deposit")
-
-                            print("*Deposit Success*\n"
-                                  "Balance of address %s has recharged on *%s* firos." % (
-                                      sparkcoin_addr[0]['address'], value_in_coins
-                                  ))
-                            continue
-
-                        _is_tx_exist_withdraw = self.col_txs.find_one(
-                            {"txId": _tx['txid'], "type": "withdraw"}
-                        ) is not None
-
-                        pending_sender = self.col_senders.find_one(
-                            {"txId": _tx['txid'], "status": "pending"}
-                        )
-                        if not pending_sender:
-                            continue
-                        _user_sender = self.col_users.find_one({"_id": pending_sender['user_id']})
-                        if _user_sender is not None and not _is_tx_exist_withdraw and _tx['category'] == "spend":
-
-                            value_in_coins = float((abs(_tx['amount'])))
-
-                            if _tx['confirmations'] >= 2:
-                                _id = str(uuid.uuid4())
-                                self.col_txs.insert_one({
-                                    '_id': _id,
-                                    "txId": _tx['txid'],
-                                    **_tx,
-                                    'type': "withdraw",
-                                    'timestamp': datetime.datetime.now()
-                                })
-                                new_locked = float(_user_sender['Locked']) - value_in_coins
-                                if new_locked >= 0:
-                                    self.col_users.update_one(
-                                        {
-                                            "_id": _user_sender['_id']
-                                        },
-                                        {
-                                            "$set":
-                                                {
-                                                    "Locked": float("{0:.8f}".format(new_locked)),
-                                                    "IsWithdraw": False
-                                                }
-                                        }
-                                    )
-                                else:
-                                    new_balance = float(_user_sender['Balance']) - value_in_coins
-                                    self.col_users.update_one(
-                                        {
-                                            "_id": _user_sender['_id']
-                                        },
-                                        {
-                                            "$set":
-                                                {
-                                                    "Balance": float("{0:.8f}".format(new_balance)),
-                                                    "IsWithdraw": False
-                                                }
-                                        }
-                                    )
-
-                                self.create_send_tips_image(_user_sender['_id'],
-                                                            "{0:.8f}".format(float(abs(_tx['amount']))),
-                                                            "%s..." % _user_sender['Address'][0][:8])
-
-                                self.col_senders.update_one(
-                                    {"txId": _tx['txid'], "status": "pending", "user_id": _user_sender['_id']},
-                                    {"$set": {"status": "completed"}}
+                        # Start a session for transaction to ensure that it's an atomic update.
+                        with client.start_session() as session:
+                            with session.start_transaction():
+                                sparkcoin_addr = wallet_api.get_spark_coin_address(unused_mnt['txid'])
+                                _user_receiver = self.col_users.find_one(
+                                    {"Address": sparkcoin_addr[0]['address']},
+                                    session=session
                                 )
-                                print("*Withdrawal Success*\n"
-                                      "Balance of address %s has recharged on *%s* firos." % (
-                                          _user_sender['Address'], value_in_coins
-                                      ))
-                                continue
+
+                                _is_tx_exist_deposit = self.col_txs.find_one(
+                                    {"txId": _tx['txid'], "type": "deposit"},
+                                    session=session
+                                ) is not None
+                                if _user_receiver is not None and \
+                                        not _is_tx_exist_deposit and \
+                                        _tx['confirmations'] >= 2 and _tx['category'] == 'receive':
+
+                                    value_in_coins = float(_tx['amount'])
+                                    new_balance = _user_receiver['Balance'] + value_in_coins
+                                    _id = str(uuid.uuid4())
+                                    self.col_txs.insert_one({
+                                        '_id': _id,
+                                        'txId': _tx['txid'],
+                                        **_tx,
+                                        'type': "deposit",
+                                        'timestamp': datetime.datetime.now()
+                                    }, session=session)
+                                    self.col_users.update_one(
+                                        {"_id": _user_receiver['_id']},
+                                        {"$set": {"Balance": float("{0:.8f}".format(new_balance))}},
+                                        session=session
+                                    )
+                                    self.create_receive_tips_image(
+                                        _user_receiver['_id'],
+                                        "{0:.8f}".format(value_in_coins),
+                                        "Deposit"
+                                    )
+                                    print(f"*Deposit Success*\nBalance of address {sparkcoin_addr[0]['address']} "
+                                          f"has recharged on *{value_in_coins}* firos.")
+                                    continue
+
+                                _is_tx_exist_withdraw = self.col_txs.find_one(
+                                    {"txId": _tx['txid'], "type": "withdraw"},
+                                    session=session
+                                ) is not None
+
+                                pending_sender = self.col_senders.find_one(
+                                    {"txId": _tx['txid'], "status": "pending"},
+                                    session=session
+                                )
+                                if pending_sender and not _is_tx_exist_withdraw and _tx['category'] == "spend":
+                                    _user_sender = self.col_users.find_one({"_id": pending_sender['user_id']}, session=session)
+                                    if _user_sender is not None:
+
+                                        value_in_coins = float(abs(_tx['amount']))
+                                        if _tx['confirmations'] >= 2:
+                                            _id = str(uuid.uuid4())
+                                            self.col_txs.insert_one({
+                                                '_id': _id,
+                                                "txId": _tx['txid'],
+                                                **_tx,
+                                                'type': "withdraw",
+                                                'timestamp': datetime.datetime.now()
+                                            }, session=session)
+
+                                            # Handle locked balance first.
+                                            new_locked = float(_user_sender['Locked']) - value_in_coins
+                                            if new_locked >= 0:
+                                                self.col_users.update_one(
+                                                    {"_id": _user_sender['_id']},
+                                                    {"$set": {
+                                                        "Locked": float("{0:.8f}".format(new_locked)),
+                                                        "IsWithdraw": False
+                                                    }},
+                                                    session=session
+                                                )
+                                            else:
+                                                # If locked balance is insufficient, subtract from available balance.
+                                                new_balance = float(_user_sender['Balance']) - value_in_coins
+                                                self.col_users.update_one(
+                                                    {"_id": _user_sender['_id']},
+                                                    {"$set": {
+                                                        "Balance": float("{0:.8f}".format(new_balance)),
+                                                        "IsWithdraw": False
+                                                    }},
+                                                    session=session
+                                                )
+
+                                            self.create_send_tips_image(_user_sender['_id'],
+                                                                        "{0:.8f}".format(value_in_coins),
+                                                                        f"{_user_sender['Address'][0][:8]}...")
+
+                                            # Update sender status to completed.
+                                            self.col_senders.update_one(
+                                                {"txId": _tx['txid'], "status": "pending", "user_id": _user_sender['_id']},
+                                                {"$set": {"status": "completed"}},
+                                                session=session
+                                            )
+                                            print(f"*Withdrawal Success*\nBalance of address {sparkcoin_addr[0]['address']} "
+                                                  f"has been deducted by *{value_in_coins}* firos.")
+                                            continue
 
                 except Exception as exc:
                     print(exc)
@@ -547,78 +539,51 @@ class TipBot:
 
     def withdraw_coins(self, address, amount, comment=""):
         """
-            Withdraw coins to address with params:
-            address
-            amount
+        Withdraw coins to address with params:
+        address
+        amount
         """
         try:
-
-            try:
-                amount = float(amount)
-            except Exception as exc:
-                self.send_message(self.user_id,
-                                  dictionary['incorrect_amount'],
-                                  parse_mode='HTML')
-                print(exc)
-                traceback.print_exc()
-                return
-
-            _is_address_valid = False
+            amount = float(amount)
             validate = self.wallet_api.validate_address(address)['result']
             is_valid_spark = 'isvalidSpark'
             is_valid_firo = 'isvalid'
-            if is_valid_spark in validate or is_valid_firo in validate:
-                _is_address_valid = True
-
-            if not _is_address_valid:
-                self.send_message(
-                    self.user_id,
-                    "<b>You specified incorrect address</b>",
-                    parse_mode='HTML'
-                )
+            if is_valid_spark not in validate and is_valid_firo not in validate:
+                self.send_message(self.user_id, "<b>You specified an incorrect address</b>", parse_mode='HTML')
                 return
 
-            if float(self.balance_in_firo) >= float("{0:.8f}".format(amount)) and float(self.balance_in_firo) >= AV_FEE:
-
-                _user = self.col_users.find_one({"_id": self.user_id})
-
-                new_balance = float("{0:.8f}".format(float(self.balance_in_firo - amount)))
-                new_locked = float("{0:.8f}".format(float(self.locked_in_firo + amount - AV_FEE)))
-                response = self.wallet_api.spendspark(
-                    address,
-                    float(amount),
-                    comment
-                )
-                print(response, "withdraw")
-                if response.get('error'):
-                    self.send_message(
-                        self.user_id, "Not enough inputs. Try to repeat a bit later!"
+            # Atomic operation to lock the user's balance and update it
+            with client.start_session() as session:
+                with session.start_transaction():
+                    user = self.col_users.find_one_and_update(
+                        {"_id": self.user_id, "Balance": {"$gte": amount + AV_FEE}},
+                        {"$inc": {"Balance": -amount, "Locked": amount + AV_FEE}},
+                        return_document=ReturnDocument.AFTER,
+                        session=session
                     )
-                    self.send_to_logs(f"Unavailable Withdraw\n{str(response)}")
-                    return
+                    if not user:
+                        self.insufficient_balance_image()
+                        return
 
-                self.col_senders.insert_one(
-                    {"txId": response['result'], "status": "pending", "user_id": self.user_id}
-                )
-                self.col_users.update_one(
-                    {
-                        "_id": self.user_id
-                    },
-                    {
-                        "$set":
-                            {
-                                "Balance": new_balance,
-                                "Locked": new_locked,
-                            }
-                    }
-                )
-                self.withdraw_image(self.user_id,
-                                    "{0:.8f}".format(float(amount)),
-                                    address,
-                                    msg=f"Your txId {response['result']}")
+                    # Proceed with the withdrawal
+                    response = self.wallet_api.spendspark(address, amount, comment)
+                    if response.get('error'):
+                        # Rollback if spend failed
+                        self.col_users.update_one(
+                            {"_id": self.user_id},
+                            {"$inc": {"Balance": amount, "Locked": -(amount + AV_FEE)}},
+                            session=session
+                        )
+                        self.send_message(self.user_id, "Not enough inputs. Try again later!")
+                        self.send_to_logs(f"Unavailable Withdraw\n{str(response)}")
+                        return
 
-            else:
-                self.insufficient_balance_image()
+                    # Insert the transaction into the senders collection
+                    self.col_senders.insert_one(
+                        {"txId": response['result'], "status": "pending", "user_id": self.user_id},
+                        session=session
+                    )
+                    self.withdraw_image(self.user_id, "{0:.8f}".format(amount), address, msg=f"Your txId {response['result']}")
 
         except Exception as exc:
             print(exc)
@@ -693,96 +658,47 @@ class TipBot:
         """
         try:
             if self.user_id == user_id:
-                self.send_message(
-                    self.user_id,
-                    "<b>You can't send tips to yourself!</b>",
-                    parse_mode='HTML'
-                )
+                self.send_message(self.user_id, "<b>You can't send tips to yourself!</b>", parse_mode='HTML')
                 return
 
-            _user_receiver = self.col_users.find_one({"_id": user_id})
+            with client.start_session() as session:
+                with session.start_transaction():
+                    _user_receiver = self.col_users.find_one({"_id": user_id}, session=session)
+                    if not _user_receiver or _user_receiver['IsVerified'] is False:
+                        self.send_message(self.user_id, dictionary['username_error'], parse_mode='HTML')
+                        return
 
-            if _user_receiver is None or _user_receiver['IsVerified'] is False:
-                self.send_message(self.user_id,
-                                  dictionary['username_error'],
-                                  parse_mode='HTML')
-                return
-
-            if _type == 'anonymous':
-                sender_name = str(_type).title()
-                # sender_user_id = 0000000
-            else:
-                sender_name = self.first_name
-                # sender_user_id = self.user_id
-
-            if self.balance_in_firo >= amount > 0:
-                try:
-
-                    self.create_send_tips_image(
-                        self.user_id,
-                        "{0:.8f}".format(float(amount)),
-                        _user_receiver['first_name'],
-                        comment
+                    user_sender = self.col_users.find_one_and_update(
+                        {"_id": self.user_id, "Balance": {"$gte": amount}},
+                        {"$inc": {"Balance": -amount}},
+                        return_document=ReturnDocument.AFTER,
+                        session=session
                     )
 
-                    self.create_receive_tips_image(
-                        _user_receiver['_id'],
-                        "{0:.8f}".format(float(amount)),
-                        sender_name,
-                        comment
-                    )
+                    if not user_sender:
+                        self.insufficient_balance_image()
+                        return
 
+                    # Update receiver's balance
                     self.col_users.update_one(
-                        {
-                            "_id": self.user_id
-                        },
-                        {
-                            "$set":
-                                {
-                                    "Balance": float(
-                                        "{0:.8f}".format(float(float(self.balance_in_firo) - float(amount))))
-                                }
-                        }
-                    )
-                    self.col_users.update_one(
-                        {
-                            "_id": _user_receiver['_id']
-                        },
-                        {
-                            "$set":
-                                {
-                                    "Balance": float(
-                                        "{0:.8f}".format(float(float(_user_receiver['Balance']) + float(amount))))
-                                }
-                        }
+                        {"_id": user_id},
+                        {"$inc": {"Balance": amount}},
+                        session=session
                     )
 
-                    if _type == 'anonymous':
-                        self.col_tip_logs.insert(
-                            {
-                                "type": "atip",
-                                "from_user_id": self.user_id,
-                                "to_user_id": _user_receiver['_id'],
-                                "amount": amount
-                            }
-                        )
+                    # Log the tip
+                    tip_log = {
+                        "type": "atip" if _type == "anonymous" else "tip",
+                        "from_user_id": self.user_id,
+                        "to_user_id": user_id,
+                        "amount": amount
+                    }
+                    self.col_tip_logs.insert_one(tip_log, session=session)
 
-                    else:
-                        self.col_tip_logs.insert(
-                            {
-                                "type": "tip",
-                                "from_user_id": self.user_id,
-                                "to_user_id": _user_receiver['_id'],
-                                "amount": amount
-                            }
-                        )
+                    # Create images
+                    self.create_send_tips_image(self.user_id, "{0:.8f}".format(amount), _user_receiver['first_name'], comment)
+                    self.create_receive_tips_image(user_id, "{0:.8f}".format(amount), str(_type).title() if _type else self.first_name, comment)
 
-                except Exception as exc:
-                    print(exc)
-                    traceback.print_exc()
-
-            else:
-                self.insufficient_balance_image()
         except Exception as exc:
             print(exc)
             traceback.print_exc()
