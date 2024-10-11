@@ -398,10 +398,11 @@ class TipBot:
             for unused_mnt in unused_mints:
                 try:
                     if unused_mnt['txid'] == _tx['txid']:
-                        """
-                            Check withdraw txs    
-                        """
                         sparkcoin_addr = wallet_api.get_spark_coin_address(unused_mnt['txid'])
+
+                        """
+                            Check deposit txs    
+                        """
                         _user_receiver = self.col_users.find_one(
                             {"Address": sparkcoin_addr[0]['address']}
                         )
@@ -443,6 +444,9 @@ class TipBot:
                                   ))
                             continue
 
+                        """
+                            Check withdraw txs    
+                        """
                         _is_tx_exist_withdraw = self.col_txs.find_one(
                             {"txId": _tx['txid'], "type": "withdraw"}
                         ) is not None
