@@ -598,7 +598,7 @@ class TipBot:
                 new_locked = float("{0:.8f}".format(float(self.locked_in_firo + amount - AV_FEE)))
                 response = self.wallet_api.spendspark(
                     address,
-                    float(amount),
+                    float(amount - AV_FEE),
                     comment
                 )
                 print(response, "withdraw")
