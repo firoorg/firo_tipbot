@@ -398,10 +398,11 @@ class TipBot:
             for unused_mnt in unused_mints:
                 try:
                     if unused_mnt['txid'] == _tx['txid']:
-                        """
-                            Check withdraw txs    
-                        """
                         sparkcoin_addr = wallet_api.get_spark_coin_address(unused_mnt['txid'])
+
+                        """
+                            Check deposit txs    
+                        """
                         _user_receiver = self.col_users.find_one(
                             {"Address": sparkcoin_addr[0]['address']}
                         )
@@ -443,6 +444,9 @@ class TipBot:
                                   ))
                             continue
 
+                        """
+                            Check withdraw txs    
+                        """
                         _is_tx_exist_withdraw = self.col_txs.find_one(
                             {"txId": _tx['txid'], "type": "withdraw"}
                         ) is not None
@@ -519,7 +523,9 @@ class TipBot:
         """
         try:
             _user = self.col_users.find_one({"_id": self.user_id})
-            self.update_address_and_balance(_user)
+            if self.update_address_and_balance(_user):
+                # ensure _user is up to date with updated address
+                _user = self.col_users.find_one({"_id": self.user_id})
             return _user['Address'], _user['Balance'], _user['Locked'], _user['IsWithdraw']
         except Exception as exc:
             print(exc)
@@ -527,23 +533,29 @@ class TipBot:
             return None, None, None, None
 
     def update_address_and_balance(self, _user):
-        mints = wallet_api.listsparkmints()
-        if len(mints) > 0:
-            # Check if User has a Lelantus address
-            valid = wallet_api.validate_address(_user['Address'][0])['result']
-            is_valid_firo = 'isvalid'
-            # User still has Lelantus address, Update address and balance
-            if is_valid_firo in valid:
-                spark_address = wallet_api.create_user_wallet()
-                self.col_users.update_one(
-                    _user,
-                    {
-                        "$set":
-                            {
-                                "Address": spark_address[0],
-                            }
-                    }
-                )
+        # Check if User has a Spark address
+        valid = wallet_api.validate_address(_user['Address'][0])['result']
+        is_valid_spark = 'isvalidSpark'
+        if is_valid_spark in valid:
+            # no update required
+            return False
+        else:
+            # Get a spark address and update user
+            spark_address = wallet_api.create_user_wallet()
+            self.col_users.update_one(
+                _user,
+                {
+                    "$set":
+                        {
+                            "Address": spark_address[0],
+                        }
+                }
+            )
+            return True
+
+        # TODO: Check if balances should be updated as per the function name?
+        # mints = wallet_api.listsparkmints()
+        # if len(mints) > 0:
 
     def withdraw_coins(self, address, amount, comment=""):
         """
@@ -586,7 +598,7 @@ class TipBot:
                 new_locked = float("{0:.8f}".format(float(self.locked_in_firo + amount - AV_FEE)))
                 response = self.wallet_api.spendspark(
                     address,
-                    float(amount),
+                    float(amount - AV_FEE),
                     comment
                 )
                 print(response, "withdraw")
