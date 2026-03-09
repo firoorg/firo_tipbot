@@ -239,6 +239,17 @@ class TipBot:
             try:
                 if args is not None and len(args) >= 1:
                     if cmd.startswith("/atip"):
+                        if self.message.chat['type'] != 'private':
+                            try:
+                                self.bot.delete_message(self.group_id, self.message.message_id)
+                            except Exception:
+                                pass
+                            self.send_message(
+                                self.user_id,
+                                "<b>Anonymous tips can only be sent via DM.</b> Your command in the group would reveal your identity.",
+                                parse_mode='HTML'
+                            )
+                            return
                         _type = "anonymous"
                     else:
                         _type = None
@@ -857,20 +868,13 @@ class TipBot:
             # Notify the group chat that a tip was sent
             if self.group_id != self.user_id:
                 tip_amount = "{0:.4f}".format(amount)
-                if _type == 'anonymous':
-                    group_msg = "<b>Anonymous</b> tipped <a href='tg://user?id=%s'>%s</a> <b>%s Firo</b>" % (
-                        _user_receiver['_id'],
-                        self.cleanhtml(_user_receiver['first_name']),
-                        tip_amount
-                    )
-                else:
-                    group_msg = "<a href='tg://user?id=%s'>%s</a> tipped <a href='tg://user?id=%s'>%s</a> <b>%s Firo</b>" % (
-                        self.user_id,
-                        self.cleanhtml(self.first_name),
-                        _user_receiver['_id'],
-                        self.cleanhtml(_user_receiver['first_name']),
-                        tip_amount
-                    )
+                group_msg = "<a href='tg://user?id=%s'>%s</a> tipped <a href='tg://user?id=%s'>%s</a> <b>%s Firo</b>" % (
+                    self.user_id,
+                    self.cleanhtml(self.first_name),
+                    _user_receiver['_id'],
+                    self.cleanhtml(_user_receiver['first_name']),
+                    tip_amount
+                )
                 self.send_message(self.group_id, group_msg, parse_mode='HTML')
 
         except Exception as exc:
