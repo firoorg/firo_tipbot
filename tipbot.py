@@ -558,9 +558,8 @@ class TipBot:
                 if remains <= 0:
                     continue
 
-                store_remains = decimal_to_store(remains)
-
                 # Atomically zero out the envelope remains and mark as expired
+                # Use BEFORE to get the actual remains at update time (avoids race with catch_envelope)
                 updated = self.col_envelopes.find_one_and_update(
                     {
                         "_id": envelope['_id'],
@@ -574,10 +573,16 @@ class TipBot:
                             "expired_at": int(datetime.datetime.now().timestamp())
                         }
                     },
-                    return_document=ReturnDocument.AFTER
+                    return_document=ReturnDocument.BEFORE
                 )
                 if not updated:
                     continue
+
+                # Use the actual remains from the document at update time
+                actual_remains = to_decimal(updated['remains'])
+                if actual_remains <= 0:
+                    continue
+                store_remains = decimal_to_store(actual_remains)
 
                 # Credit the creator
                 self.col_users.update_one(
@@ -586,7 +591,7 @@ class TipBot:
                 )
 
                 logger.info("Envelope %s expired: refunded %s FIRO to user %s",
-                            envelope['_id'], remains, envelope['creator_id'])
+                            envelope['_id'], actual_remains, envelope['creator_id'])
 
                 # Notify the creator
                 try:
@@ -594,7 +599,7 @@ class TipBot:
                         envelope['creator_id'],
                         "<b>Your red envelope expired.</b>\n"
                         "<b>%s FIRO</b> unclaimed funds have been returned to your balance." %
-                        "{0:.8f}".format(remains),
+                        "{0:.8f}".format(actual_remains),
                         parse_mode='HTML'
                     )
                 except Exception as exc:
