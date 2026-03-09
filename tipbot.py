@@ -108,6 +108,7 @@ class TipBot:
             None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
         self.wallet_api.automintunspent()
+        self.expire_envelopes()  # clean up envelopes that expired while bot was offline
         schedule.every(60).seconds.do(self.update_balance)
         schedule.every(60).seconds.do(self.expire_envelopes)
         schedule.every(300).seconds.do(self.wallet_api.automintunspent)
