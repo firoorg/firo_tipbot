@@ -65,6 +65,7 @@ class TipBot:
         self.col_tip_logs = db['tip_logs']
         self.col_envelopes = db['envelopes']
         self.col_txs = db['txs']
+        self.col_pending_tips = db['pending_tips']
         self.get_wallet_balance()
         self.update_balance()
 
@@ -77,6 +78,7 @@ class TipBot:
         self.wallet_api.automintunspent()
         schedule.every(60).seconds.do(self.update_balance)
         schedule.every(300).seconds.do(self.wallet_api.automintunspent)
+        schedule.every(300).seconds.do(self.expire_pending_tips)
         threading.Thread(target=self.pending_tasks).start()
 
         self.new_message = None
@@ -94,6 +96,96 @@ class TipBot:
         while True:
             schedule.run_pending()
             time.sleep(5)
+
+    def expire_pending_tips(self):
+        """Refund pending tips older than 24 hours"""
+        try:
+            cutoff = datetime.datetime.now() - datetime.timedelta(days=1)
+            expired_tips = list(self.col_pending_tips.find({"created_at": {"$lt": cutoff}}))
+
+            for tip in expired_tips:
+                # Refund sender
+                sender = self.col_users.find_one({"_id": tip['from_user_id']})
+                if sender is not None:
+                    new_balance = float("{0:.8f}".format(float(sender['Balance']) + float(tip['amount'])))
+                    self.col_users.update_one(
+                        {"_id": tip['from_user_id']},
+                        {"$set": {"Balance": new_balance}}
+                    )
+                    try:
+                        self.send_message(
+                            tip['from_user_id'],
+                            "<b>Tip refunded:</b> Your tip of <b>{0:.8f} FIRO</b> was unclaimed for "
+                            "24 hours and has been returned to your balance.".format(float(tip['amount'])),
+                            parse_mode='HTML'
+                        )
+                    except Exception:
+                        pass
+
+                # Remove the pending tip
+                self.col_pending_tips.delete_one({"_id": tip['_id']})
+
+                # Update tip log
+                self.col_tip_logs.update_one(
+                    {
+                        "from_user_id": tip['from_user_id'],
+                        "to_user_id": tip['to_user_id'],
+                        "amount": tip['amount'],
+                        "pending": True
+                    },
+                    {"$set": {"pending": False, "refunded": True}}
+                )
+
+        except Exception as exc:
+            print(exc)
+            traceback.print_exc()
+
+    def process_pending_tips(self, user_id):
+        """Process all pending tips for a user who just started the bot"""
+        try:
+            pending_tips = list(self.col_pending_tips.find({"to_user_id": user_id}))
+            total_amount = 0
+
+            for tip in pending_tips:
+                total_amount += tip['amount']
+
+                # Send receive image for each tip
+                try:
+                    self.create_receive_tips_image(
+                        user_id,
+                        "{0:.8f}".format(float(tip['amount'])),
+                        tip['sender_name'],
+                        tip.get('comment', '')
+                    )
+                except Exception:
+                    pass
+
+                # Update tip log
+                self.col_tip_logs.update_one(
+                    {
+                        "from_user_id": tip['from_user_id'],
+                        "to_user_id": tip['to_user_id'],
+                        "amount": tip['amount'],
+                        "pending": True
+                    },
+                    {"$set": {"pending": False}}
+                )
+
+                # Remove pending tip
+                self.col_pending_tips.delete_one({"_id": tip['_id']})
+
+            if total_amount > 0:
+                # Credit all pending tips to the receiver
+                receiver = self.col_users.find_one({"_id": user_id})
+                new_balance = float("{0:.8f}".format(float(receiver['Balance']) + float(total_amount)))
+                self.col_users.update_one(
+                    {"_id": user_id},
+                    {"$set": {"Balance": new_balance}}
+                )
+
+        except Exception as exc:
+            print(exc)
+            traceback.print_exc()
 
     def processing_messages(self, new_messages):
         for self.new_message in new_messages:
@@ -659,12 +751,19 @@ class TipBot:
             _is_username_exists = _user is not None
 
             if not _is_username_exists:
-                self.send_message(self.user_id,
-                                  dictionary['username_error'],
-                                  parse_mode='HTML')
+                self.send_message(
+                    self.user_id,
+                    "<b>This user hasn't started the bot yet.</b> "
+                    "To tip them, reply to one of their messages with "
+                    "<code>/tip amount</code> — the tip will be held "
+                    "until they start the bot.",
+                    parse_mode='HTML'
+                )
                 return
 
-            self.send_tip(_user['_id'], amount, _type, comment)
+            self.send_tip(_user['_id'], amount, _type, comment,
+                          receiver_first_name=_user.get('first_name'),
+                          receiver_username=_user.get('username'))
 
         except Exception as exc:
             print(exc)
@@ -685,18 +784,21 @@ class TipBot:
                 traceback.print_exc()
                 return
 
+            _reply_user = self.message.reply_to_message.from_user
             self.send_tip(
-                self.message.reply_to_message.from_user.id,
+                _reply_user.id,
                 amount,
                 _type,
-                comment
+                comment,
+                receiver_first_name=_reply_user.first_name,
+                receiver_username=_reply_user.username
             )
 
         except Exception as exc:
             print(exc)
             traceback.print_exc()
 
-    def send_tip(self, user_id, amount, _type, comment):
+    def send_tip(self, user_id, amount, _type, comment, receiver_first_name=None, receiver_username=None):
         """
             Send tip to user with params
             user_id - user identificator
@@ -714,18 +816,30 @@ class TipBot:
 
             _user_receiver = self.col_users.find_one({"_id": user_id})
 
+            _is_pending = False
             if _user_receiver is None or _user_receiver['IsVerified'] is False:
-                self.send_message(self.user_id,
-                                  dictionary['username_error'],
-                                  parse_mode='HTML')
-                return
+                _is_pending = True
+                # Auto-create a stub record for the unregistered receiver
+                if _user_receiver is None:
+                    receiver_first_name = receiver_first_name or "User"
+                    self.col_users.update_one(
+                        {"_id": user_id},
+                        {"$set": {
+                            "first_name": receiver_first_name,
+                            "username": receiver_username,
+                            "IsVerified": False,
+                            "Balance": 0,
+                            "Locked": 0,
+                            "IsWithdraw": False,
+                        }},
+                        upsert=True
+                    )
+                    _user_receiver = self.col_users.find_one({"_id": user_id})
 
             if _type == 'anonymous':
                 sender_name = str(_type).title()
-                # sender_user_id = 0000000
             else:
                 sender_name = self.first_name
-                # sender_user_id = self.user_id
 
             if self.balance_in_firo >= amount > 0:
                 try:
@@ -737,13 +851,46 @@ class TipBot:
                         comment
                     )
 
-                    self.create_receive_tips_image(
-                        _user_receiver['_id'],
-                        "{0:.8f}".format(float(amount)),
-                        sender_name,
-                        comment
-                    )
+                    if _is_pending:
+                        # Store pending tip for later delivery
+                        self.col_pending_tips.insert_one({
+                            "from_user_id": self.user_id,
+                            "to_user_id": user_id,
+                            "amount": amount,
+                            "type": "atip" if _type == 'anonymous' else "tip",
+                            "sender_name": sender_name,
+                            "comment": comment,
+                            "created_at": datetime.datetime.now()
+                        })
 
+                        # Notify sender that tip is pending
+                        self.send_message(
+                            self.user_id,
+                            "<b>Tip sent!</b> The receiver hasn't started the bot yet — "
+                            "they'll receive the funds once they start the bot. "
+                            "If unclaimed within 24 hours, the tip will be refunded to you.",
+                            parse_mode='HTML'
+                        )
+
+                        # Notify in group chat if applicable
+                        if self.message.chat['type'] != 'private':
+                            self.send_message(
+                                self.group_id,
+                                f'<a href="tg://user?id={user_id}">{_user_receiver["first_name"]}</a>, '
+                                f'you\'ve received a tip! '
+                                f'<a href="https://t.me/firo_tipbot?start=claim">Start the bot</a> to claim it.',
+                                parse_mode='HTML',
+                                disable_web_page_preview=True
+                            )
+                    else:
+                        self.create_receive_tips_image(
+                            _user_receiver['_id'],
+                            "{0:.8f}".format(float(amount)),
+                            sender_name,
+                            comment
+                        )
+
+                    # Deduct from sender immediately
                     self.col_users.update_one(
                         {
                             "_id": self.user_id
@@ -756,18 +903,21 @@ class TipBot:
                                 }
                         }
                     )
-                    self.col_users.update_one(
-                        {
-                            "_id": _user_receiver['_id']
-                        },
-                        {
-                            "$set":
-                                {
-                                    "Balance": float(
-                                        "{0:.8f}".format(float(float(_user_receiver['Balance']) + float(amount))))
-                                }
-                        }
-                    )
+
+                    if not _is_pending:
+                        # Credit receiver immediately (registered user)
+                        self.col_users.update_one(
+                            {
+                                "_id": _user_receiver['_id']
+                            },
+                            {
+                                "$set":
+                                    {
+                                        "Balance": float(
+                                            "{0:.8f}".format(float(float(_user_receiver['Balance']) + float(amount))))
+                                    }
+                            }
+                        )
 
                     if _type == 'anonymous':
                         self.col_tip_logs.insert(
@@ -775,7 +925,8 @@ class TipBot:
                                 "type": "atip",
                                 "from_user_id": self.user_id,
                                 "to_user_id": _user_receiver['_id'],
-                                "amount": amount
+                                "amount": amount,
+                                "pending": _is_pending
                             }
                         )
 
@@ -785,7 +936,8 @@ class TipBot:
                                 "type": "tip",
                                 "from_user_id": self.user_id,
                                 "to_user_id": _user_receiver['_id'],
-                                "amount": amount
+                                "amount": amount,
+                                "pending": _is_pending
                             }
                         )
 
@@ -1245,6 +1397,8 @@ class TipBot:
                         {
                             "$set":
                                 {
+                                    "first_name": self.first_name,
+                                    "username": self.username,
                                     "IsVerified": True,
                                     "Address": public_address,
                                     "Balance": 0,
@@ -1255,6 +1409,8 @@ class TipBot:
                     )
                     self.create_wallet_image(public_address)
 
+                    # Process any pending tips for this user
+                    self.process_pending_tips(self.user_id)
 
                 else:
                     self.col_users.update_one(
@@ -1284,6 +1440,9 @@ class TipBot:
                     )
                     self.create_wallet_image(public_address)
 
+                    # Process any pending tips for this user
+                    self.process_pending_tips(self.user_id)
+
             else:
                 self.col_users.update_one(
                     {
@@ -1301,6 +1460,9 @@ class TipBot:
                     WELCOME_MESSAGE,
                     parse_mode='html',
                 )
+
+                # Process any pending tips for this user
+                self.process_pending_tips(self.user_id)
         except Exception as exc:
             print(exc)
             traceback.print_exc()
