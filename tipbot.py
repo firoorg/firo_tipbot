@@ -15,10 +15,28 @@ import matplotlib.pyplot as plt
 import datetime
 import time
 from decimal import Decimal, ROUND_DOWN
+from bson.decimal128 import Decimal128
+from bson.codec_options import CodecOptions, TypeCodec, TypeRegistry
 from pymongo import MongoClient, ReturnDocument
 from telegram import Bot, InlineKeyboardMarkup, InlineKeyboardButton
 import uuid
 from api.firo_wallet_api import FiroWalletAPI
+
+
+class DecimalCodec(TypeCodec):
+    """Codec to transparently convert between Python Decimal and BSON Decimal128."""
+    python_type = Decimal
+    bson_type = Decimal128
+
+    def transform_python(self, value):
+        return Decimal128(value)
+
+    def transform_bson(self, value):
+        return value.to_decimal()
+
+
+decimal_codec = DecimalCodec()
+type_registry = TypeRegistry([decimal_codec])
 
 plt.style.use('seaborn-whitegrid')
 
@@ -38,8 +56,8 @@ def to_decimal(value):
 
 
 def decimal_to_store(value):
-    """Convert Decimal to float for MongoDB storage (backward compatible)."""
-    return float(to_decimal(value))
+    """Quantize a value to 8 decimal places for MongoDB storage as Decimal128."""
+    return to_decimal(value)
 
 with open('services.json') as conf_file:
     conf = json.load(conf_file)
@@ -70,7 +88,8 @@ class TipBot:
         self.wallet_api = wallet_api
         # Firo Butler Initialization
         self.client = MongoClient(connectionString)
-        db = self.client.get_default_database()
+        codec_options = CodecOptions(type_registry=type_registry)
+        db = self.client.get_default_database(codec_options=codec_options)
         self.col_captcha = db['captcha']
         self.col_commands_history = db['commands_history']
         self.col_users = db['users']
@@ -1203,8 +1222,8 @@ class TipBot:
                                 {
                                     "IsVerified": True,
                                     "Address": public_address,
-                                    "Balance": 0.0,
-                                    "Locked": 0.0,
+                                    "Balance": Decimal('0'),
+                                    "Locked": Decimal('0'),
                                     "IsWithdraw": False
                                 }
                         }, upsert=True
@@ -1226,8 +1245,8 @@ class TipBot:
                                     "IsVerified": True,
                                     "JoinDate": datetime.datetime.now(),
                                     "Address": public_address,
-                                    "Balance": 0.0,
-                                    "Locked": 0.0,
+                                    "Balance": Decimal('0'),
+                                    "Locked": Decimal('0'),
                                     "IsWithdraw": False,
                                 }
                         }, upsert=True
