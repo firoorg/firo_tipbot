@@ -101,9 +101,13 @@ class TipBot:
         """Refund pending tips older than 24 hours"""
         try:
             cutoff = datetime.datetime.now() - datetime.timedelta(days=1)
-            expired_tips = list(self.col_pending_tips.find({"created_at": {"$lt": cutoff}}))
 
-            for tip in expired_tips:
+            # Use find_one_and_delete to atomically fetch and delete each expired tip
+            while True:
+                tip = self.col_pending_tips.find_one_and_delete({"created_at": {"$lt": cutoff}})
+                if tip is None:
+                    break
+
                 # Refund sender
                 sender = self.col_users.find_one({"_id": tip['from_user_id']})
                 if sender is not None:
@@ -121,9 +125,6 @@ class TipBot:
                         )
                     except Exception:
                         pass
-
-                # Remove the pending tip
-                self.col_pending_tips.delete_one({"_id": tip['_id']})
 
                 # Update tip log
                 self.col_tip_logs.update_one(
@@ -143,13 +144,22 @@ class TipBot:
     def process_pending_tips(self, user_id):
         """Process all pending tips for a user who just started the bot"""
         try:
-            pending_tips = list(self.col_pending_tips.find({"to_user_id": user_id}))
-            total_amount = 0
+            # Use find_one_and_delete to atomically fetch and delete each pending tip
+            while True:
+                tip = self.col_pending_tips.find_one_and_delete({"to_user_id": user_id})
+                if tip is None:
+                    break
 
-            for tip in pending_tips:
-                total_amount += tip['amount']
+                # Credit receiver immediately after atomic deletion
+                receiver = self.col_users.find_one({"_id": user_id})
+                if receiver is not None:
+                    new_balance = float("{0:.8f}".format(float(receiver['Balance']) + float(tip['amount'])))
+                    self.col_users.update_one(
+                        {"_id": user_id},
+                        {"$set": {"Balance": new_balance}}
+                    )
 
-                # Send receive image for each tip
+                # Send receive image for the tip
                 try:
                     self.create_receive_tips_image(
                         user_id,
@@ -169,18 +179,6 @@ class TipBot:
                         "pending": True
                     },
                     {"$set": {"pending": False}}
-                )
-
-                # Remove pending tip
-                self.col_pending_tips.delete_one({"_id": tip['_id']})
-
-            if total_amount > 0:
-                # Credit all pending tips to the receiver
-                receiver = self.col_users.find_one({"_id": user_id})
-                new_balance = float("{0:.8f}".format(float(receiver['Balance']) + float(total_amount)))
-                self.col_users.update_one(
-                    {"_id": user_id},
-                    {"$set": {"Balance": new_balance}}
                 )
 
         except Exception as exc:
