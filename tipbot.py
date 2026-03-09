@@ -543,13 +543,10 @@ class TipBot:
             })
 
             for envelope in expired:
-                remains = to_decimal(envelope['remains'])
-                if remains <= 0:
-                    continue
-
-                store_remains = decimal_to_store(remains)
-
                 # Atomically zero out the envelope remains and mark as expired
+                # Use BEFORE to capture the actual remains at update time,
+                # avoiding a race where catch_envelope reduces remains after
+                # the cursor read but before this update.
                 updated = self.col_envelopes.find_one_and_update(
                     {
                         "_id": envelope['_id'],
@@ -563,10 +560,16 @@ class TipBot:
                             "expired_at": int(datetime.datetime.now().timestamp())
                         }
                     },
-                    return_document=ReturnDocument.AFTER
+                    return_document=ReturnDocument.BEFORE
                 )
                 if not updated:
                     continue
+
+                # Read the actual remains from the atomically-returned document
+                remains = to_decimal(updated['remains'])
+                if remains <= 0:
+                    continue
+                store_remains = decimal_to_store(remains)
 
                 # Credit the creator
                 self.col_users.update_one(
