@@ -48,6 +48,7 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 AV_FEE = Decimal('0.002')
+ENVELOPE_EXPIRY_SECONDS = 86400  # 24 hours
 
 
 def to_decimal(value):
@@ -108,6 +109,7 @@ class TipBot:
 
         self.wallet_api.automintunspent()
         schedule.every(60).seconds.do(self.update_balance)
+        schedule.every(60).seconds.do(self.expire_envelopes)
         schedule.every(300).seconds.do(self.wallet_api.automintunspent)
         threading.Thread(target=self.pending_tasks).start()
 
@@ -525,6 +527,76 @@ class TipBot:
 
                 except Exception as exc:
                     logger.error(exc, exc_info=True)
+
+    def expire_envelopes(self):
+        """
+            Find envelopes older than 24 hours with unclaimed funds,
+            refund the remaining balance to the creator, and mark as expired.
+        """
+        try:
+            cutoff = int(datetime.datetime.now().timestamp()) - ENVELOPE_EXPIRY_SECONDS
+            expired = self.col_envelopes.find({
+                "created_at": {"$lte": cutoff},
+                "remains": {"$gt": 0},
+                "expired": {"$ne": True}
+            })
+
+            for envelope in expired:
+                remains = to_decimal(envelope['remains'])
+                if remains <= 0:
+                    continue
+
+                store_remains = decimal_to_store(remains)
+
+                # Atomically zero out the envelope remains and mark as expired
+                updated = self.col_envelopes.find_one_and_update(
+                    {
+                        "_id": envelope['_id'],
+                        "remains": {"$gt": 0},
+                        "expired": {"$ne": True}
+                    },
+                    {
+                        "$set": {
+                            "remains": decimal_to_store(Decimal('0')),
+                            "expired": True,
+                            "expired_at": int(datetime.datetime.now().timestamp())
+                        }
+                    },
+                    return_document=ReturnDocument.AFTER
+                )
+                if not updated:
+                    continue
+
+                # Credit the creator
+                self.col_users.update_one(
+                    {"_id": envelope['creator_id']},
+                    {"$inc": {"Balance": store_remains}}
+                )
+
+                logger.info("Envelope %s expired: refunded %s FIRO to user %s",
+                            envelope['_id'], remains, envelope['creator_id'])
+
+                # Notify the creator
+                try:
+                    self.bot.send_message(
+                        envelope['creator_id'],
+                        "<b>Your red envelope expired.</b>\n"
+                        "<b>%s FIRO</b> unclaimed funds have been returned to your balance." %
+                        "{0:.8f}".format(remains),
+                        parse_mode='HTML'
+                    )
+                except Exception as exc:
+                    logger.error("Failed to notify envelope creator %s: %s",
+                                 envelope['creator_id'], exc)
+
+                # Clean up the group message button
+                try:
+                    self.bot.delete_message(envelope['group_id'], envelope['msg_id'])
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            logger.error(exc, exc_info=True)
 
     def get_user_data(self):
         """
@@ -1080,7 +1152,8 @@ class TipBot:
                     "creator_id": self.user_id,
                     "msg_id": msg_id,
                     "takers": [],
-                    "created_at": int(datetime.datetime.now().timestamp())
+                    "created_at": int(datetime.datetime.now().timestamp()),
+                    "expired": False
                 }
             )
 
@@ -1097,6 +1170,14 @@ class TipBot:
 
             _is_ended = to_decimal(envelope['remains']) == 0
             _is_user_catched = str(self.user_id) in str(envelope['takers'])
+            _is_expired = envelope.get('expired', False) or \
+                (int(datetime.datetime.now().timestamp()) - envelope['created_at']) > ENVELOPE_EXPIRY_SECONDS
+
+            if _is_expired:
+                self.answer_call_back(text="❗️This red envelope has expired❗️",
+                                      query_id=self.new_message.callback_query.id)
+                self.delete_tg_message(self.group_id, self.message.message_id)
+                return
 
             if _is_user_catched:
                 self.answer_call_back(text="❗️You have already caught Firo from this envelope❗️",
@@ -1129,7 +1210,8 @@ class TipBot:
             updated_envelope = self.col_envelopes.find_one_and_update(
                 {
                     "_id": envelope_id,
-                    "remains": {"$gte": store_catch}
+                    "remains": {"$gte": store_catch},
+                    "expired": {"$ne": True}
                 },
                 {
                     "$push": {
