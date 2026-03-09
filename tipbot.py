@@ -543,13 +543,8 @@ class TipBot:
             })
 
             for envelope in expired:
-                remains = to_decimal(envelope['remains'])
-                if remains <= 0:
-                    continue
-
-                store_remains = decimal_to_store(remains)
-
                 # Atomically zero out the envelope remains and mark as expired
+                # Use BEFORE to get the actual remains at update time (avoids race with catch_envelope)
                 updated = self.col_envelopes.find_one_and_update(
                     {
                         "_id": envelope['_id'],
@@ -563,24 +558,31 @@ class TipBot:
                             "expired_at": int(datetime.datetime.now().timestamp())
                         }
                     },
-                    return_document=ReturnDocument.AFTER
+                    return_document=ReturnDocument.BEFORE
                 )
                 if not updated:
                     continue
 
+                # Read the actual remains from the document at update time
+                remains = to_decimal(updated['remains'])
+                if remains <= 0:
+                    continue
+
+                store_remains = decimal_to_store(remains)
+
                 # Credit the creator
                 self.col_users.update_one(
-                    {"_id": envelope['creator_id']},
+                    {"_id": updated['creator_id']},
                     {"$inc": {"Balance": store_remains}}
                 )
 
                 logger.info("Envelope %s expired: refunded %s FIRO to user %s",
-                            envelope['_id'], remains, envelope['creator_id'])
+                            updated['_id'], remains, updated['creator_id'])
 
                 # Notify the creator
                 try:
                     self.bot.send_message(
-                        envelope['creator_id'],
+                        updated['creator_id'],
                         "<b>Your red envelope expired.</b>\n"
                         "<b>%s FIRO</b> unclaimed funds have been returned to your balance." %
                         "{0:.8f}".format(remains),
@@ -588,11 +590,11 @@ class TipBot:
                     )
                 except Exception as exc:
                     logger.error("Failed to notify envelope creator %s: %s",
-                                 envelope['creator_id'], exc)
+                                 updated['creator_id'], exc)
 
                 # Clean up the group message button
                 try:
-                    self.bot.delete_message(envelope['group_id'], envelope['msg_id'])
+                    self.bot.delete_message(updated['group_id'], updated['msg_id'])
                 except Exception:
                     pass
 
