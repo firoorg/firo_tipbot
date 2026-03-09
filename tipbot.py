@@ -854,6 +854,25 @@ class TipBot:
                 comment
             )
 
+            # Notify the group chat that a tip was sent
+            if self.group_id != self.user_id:
+                tip_amount = "{0:.4f}".format(amount)
+                if _type == 'anonymous':
+                    group_msg = "<b>Anonymous</b> tipped <a href='tg://user?id=%s'>%s</a> <b>%s Firo</b>" % (
+                        _user_receiver['_id'],
+                        self.cleanhtml(_user_receiver['first_name']),
+                        tip_amount
+                    )
+                else:
+                    group_msg = "<a href='tg://user?id=%s'>%s</a> tipped <a href='tg://user?id=%s'>%s</a> <b>%s Firo</b>" % (
+                        self.user_id,
+                        self.cleanhtml(self.first_name),
+                        _user_receiver['_id'],
+                        self.cleanhtml(_user_receiver['first_name']),
+                        tip_amount
+                    )
+                self.send_message(self.group_id, group_msg, parse_mode='HTML')
+
         except Exception as exc:
             logger.error(exc, exc_info=True)
 
