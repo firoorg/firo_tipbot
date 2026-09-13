@@ -153,6 +153,84 @@ class FakeResponse:
 
 
 class SafetyTests(unittest.TestCase):
+    def test_main_propagates_startup_failure(self):
+        with patch.object(tipbot, "TipBot", side_effect=RuntimeError("startup failed")), \
+                patch.object(tipbot.signal, "signal"), \
+                patch.object(tipbot.traceback, "print_exc"), patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "startup failed"):
+                tipbot.main()
+
+    def test_existing_user_commands_survive_wallet_outage(self):
+        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot.bot_username = "firo_tipbot"
+        bot.col_users = MemoryCollection([{
+            "_id": 1, "Address": ["deposit"], "Balance": 1.25,
+            "Locked": 0.0, "IsWithdraw": False, "IsVerified": True,
+        }])
+        bot.wallet_api = SimpleNamespace(
+            validate_address=Mock(side_effect=FiroTransportError("offline")),
+        )
+        bot.check_username_on_change = Mock()
+        bot.send_message = Mock()
+        bot.create_qr_code = Mock()
+        update = SimpleNamespace(
+            update_id=100, callback_query=None,
+            effective_user=SimpleNamespace(id=1, first_name="Alice", username=None),
+            message=SimpleNamespace(
+                text="/balance", document=None,
+                chat=SimpleNamespace(id=1, username=None),
+            ),
+        )
+        with patch.object(tipbot.time, "sleep"), patch("builtins.print"), \
+                patch.object(tipbot.logger, "exception"):
+            for command in ("/balance", "/help"):
+                update.message.text = command
+                self.assertTrue(bot.processing_messages([update]))
+            bot.wallet_api.validate_address.assert_not_called()
+            self.assertEqual(bot.balance_in_groth, 125_000_000)
+            update.message.text = "/deposit"
+            self.assertTrue(bot.processing_messages([update]))
+
+        bot.wallet_api.validate_address.assert_called_once_with("deposit")
+        self.assertIn("unavailable", bot.send_message.call_args.args[1])
+        bot.create_qr_code.assert_not_called()
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 125_000_000)
+
+    def test_deposit_displays_only_a_successfully_refreshed_address(self):
+        for user, replacements, expected in (
+            ({"_id": 1, "Address": ["old"]}, ["new"], "new"),
+            ({"_id": 1, "Address": ["old"]}, [], None),
+            ({"_id": 1, "Address": []}, [], None),
+            (None, [], None),
+        ):
+            with self.subTest(user=user, replacements=replacements):
+                bot = tipbot.TipBot.__new__(tipbot.TipBot)
+                bot.bot_username = "firo_tipbot"
+                bot.user_id = 1
+                bot._is_user_in_db = True
+                bot.col_users = MemoryCollection([user] if user else [])
+                bot.wallet_api = SimpleNamespace(
+                    validate_address=Mock(return_value={
+                        "result": {"isvalidSpark": False}, "error": None,
+                    }),
+                    create_user_wallet=Mock(return_value=replacements),
+                )
+                bot.send_message = Mock()
+                bot.create_qr_code = Mock()
+                with patch.object(tipbot.logger, "exception"):
+                    bot.action_processing("/deposit", None)
+                if expected:
+                    self.assertEqual(bot.firo_address[-1], expected)
+                    self.assertEqual(bot.col_users.documents[1]["Address"], ["old", "new"])
+                    self.assertEqual(
+                        bot.send_message.call_args.args[1],
+                        tipbot.dictionary["deposit"] % expected,
+                    )
+                    bot.create_qr_code.assert_called_once()
+                else:
+                    self.assertIn("unavailable", bot.send_message.call_args.args[1])
+                    bot.create_qr_code.assert_not_called()
+
     def test_amounts_are_finite_positive_and_exact(self):
         self.assertEqual(tipbot.parse_amount("1.00000001"), tipbot.Decimal("1.00000001"))
         for value in ("nan", "inf", "0", "0.000000001", "100000001"):

@@ -28,6 +28,7 @@ class AccountingTests(unittest.TestCase):
         )
         bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
         bot.wallet_api = SimpleNamespace(get_tx_status=Mock())
+        bot.send_to_logs = Mock()
         return bot
 
     def test_missing_conflicted_deposit_reverses_and_recovers_once(self):
@@ -57,7 +58,7 @@ class AccountingTests(unittest.TestCase):
             bot.col_txs.documents["deposit:tx:address"]["status"], "confirmed"
         )
 
-    def test_missing_deposit_rpc_failure_preserves_credit(self):
+    def test_missing_deposit_rpc_failure_preserves_credit_and_continues(self):
         for transport_failure in (False, True):
             with self.subTest(transport_failure=transport_failure):
                 bot = self.deposit_bot()
@@ -71,8 +72,11 @@ class AccountingTests(unittest.TestCase):
                         "error": {"code": -5, "message": "Transaction not found"},
                     }
 
-                with self.assertRaises(RuntimeError):
-                    bot.reconcile_deposit_confirmations({})
+                bot.wallet_api.get_txs_list = Mock(
+                    return_value={"result": [], "error": None}
+                )
+                bot.reconcile_withdrawals = Mock()
+                bot.update_balance()
 
                 self.assertEqual(
                     bot.col_users.documents[1]["BalanceGroth"], 1_000_000_000
@@ -82,6 +86,36 @@ class AccountingTests(unittest.TestCase):
                     bot.col_txs.documents["deposit:tx:address"]["status"],
                     "confirmed",
                 )
+                event = bot.col_txs.documents["deposit:tx:address"]
+                self.assertTrue(event["review_required"])
+                self.assertIn(
+                    "RPC unavailable" if transport_failure else "Transaction not found",
+                    event["review_reason"],
+                )
+                bot.reconcile_withdrawals.assert_called_once_with([])
+
+                other = dict(event, _id="other-deposit", txId="other-tx")
+                bot.col_txs.insert_one(other)
+                transactions = [{"txid": "other-tx", "confirmations": -1}]
+                bot.wallet_api.get_txs_list.return_value["result"] = transactions
+                for _ in range(2):
+                    bot.update_balance()
+                self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 900_000_000)
+                self.assertEqual(bot.col_txs.documents["other-deposit"]["status"], "reversed")
+                self.assertEqual(bot.reconcile_withdrawals.call_count, 3)
+                bot.send_to_logs.assert_called_once()
+
+                bot.wallet_api.get_tx_status.side_effect = None
+                bot.wallet_api.get_tx_status.return_value = {
+                    "result": {"confirmations": -1}, "error": None
+                }
+                for _ in range(2):
+                    bot.update_balance()
+                self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 800_000_000)
+                self.assertEqual(event["status"], "reversed")
+                self.assertNotIn("review_required", event)
+                self.assertNotIn("review_reason", event)
+                self.assertNotIn("reviewReportedAt", event)
 
     def test_completed_money_migration_does_not_access_account_collections(self):
         bot = tipbot.TipBot.__new__(tipbot.TipBot)

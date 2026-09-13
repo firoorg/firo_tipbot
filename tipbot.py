@@ -1025,6 +1025,17 @@ class TipBot:
                                   % self.mention(self.user_id, self.first_name),
                                   parse_mode="HTML", disable_web_page_preview=True)
                 return
+            try:
+                self.firo_address = self.update_address_and_balance(
+                    self.col_users.find_one({"_id": self.user_id})
+                )
+            except Exception:
+                logger.exception("deposit address could not be refreshed")
+                self.send_message(
+                    self.user_id,
+                    "Deposit address is unavailable. Please try again later.",
+                )
+                return
             self.send_message(
                 self.user_id,
                 dictionary['deposit'] % self.firo_address[-1],
@@ -1132,11 +1143,35 @@ class TipBot:
             entries = transactions.get(event["txId"])
             if not entries:
                 # Conflicted incoming transactions can disappear from listtransactions.
-                response = self.wallet_api.get_tx_status(event["txId"])
-                if response.get("error"):
-                    raise RuntimeError(response["error"])
+                try:
+                    response = self.wallet_api.get_tx_status(event["txId"])
+                    if response.get("error"):
+                        raise FiroRPCError(response["error"])
+                except (FiroRPCError, FiroTransportError) as exc:
+                    reported = self.col_txs.update_one(
+                        {"_id": event["_id"], "review_reason": {"$ne": str(exc)}},
+                        {"$set": {
+                            "review_required": True,
+                            "review_reason": str(exc),
+                            "reviewReportedAt": datetime.datetime.utcnow(),
+                        }},
+                    )
+                    if reported.modified_count == 1:
+                        self.send_to_logs(
+                            "Deposit %s needs review: %s" % (event["txId"], exc)
+                        )
+                    continue
                 entries = [response["result"]]
                 transactions[event["txId"]] = entries
+            if event.get("review_required"):
+                self.col_txs.update_one(
+                    {"_id": event["_id"]},
+                    {"$unset": {
+                        "review_required": "",
+                        "review_reason": "",
+                        "reviewReportedAt": "",
+                    }},
+                )
             confirmations = max(entry.get("confirmations", 0) for entry in entries)
             final = (
                 confirmations >= 2
@@ -1333,7 +1368,7 @@ class TipBot:
         reported = self.col_senders.update_one(
             {
                 "_id": sender["_id"],
-                "reviewReportedAt": {"$exists": False},
+                "review_reason": {"$ne": str(reason)},
             },
             {
                 "$set": {
@@ -1693,8 +1728,6 @@ class TipBot:
         user = self.col_users.find_one({"_id": self.user_id})
         if user is None:
             return None, None, None, None
-        if self.update_address_and_balance(user):
-            user = self.col_users.find_one({"_id": self.user_id})
         return (
             normalize_addresses(user.get('Address')),
             groth_to_decimal(user['BalanceGroth']),
@@ -1716,6 +1749,8 @@ class TipBot:
 
         if valid.get("isvalidSpark") is not True:
             new_addresses = normalize_addresses(self.wallet_api.create_user_wallet())
+            if not new_addresses:
+                raise RuntimeError("wallet returned no replacement deposit address")
             for address in new_addresses:
                 if address not in addresses:
                     addresses.append(address)
@@ -1726,7 +1761,7 @@ class TipBot:
                 {"_id": user["_id"]},
                 {"$set": {"Address": addresses}},
             )
-        return changed
+        return addresses
 
     def withdraw_coins(self, address, amount, comment=""):
         """
@@ -2914,6 +2949,7 @@ def main():
     except Exception as e:
         print(e)
         traceback.print_exc()
+        raise
 
 
 if __name__ == '__main__':

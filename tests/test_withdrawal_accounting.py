@@ -80,6 +80,40 @@ class WithdrawalAccountingTests(unittest.TestCase):
         self.assertEqual(sender["txId"], "tx50")
         self.assertEqual(bot.wallet_api.spendspark.call_count, 1)
 
+    def test_ambiguous_withdrawal_reports_changed_candidates_once(self):
+        bot = self.withdrawal_bot({"code": -4, "message": "Wallet error"})
+        bot.withdraw_coins("external", "1")
+        bot.send_to_logs.reset_mock()
+        sender = bot.col_senders.documents["withdraw:50"]
+        started_at = tipbot.calendar.timegm(sender["broadcast_started_at"].utctimetuple())
+        candidate = {
+            "txid": "candidate1", "category": "spend", "address": "external",
+            "amount": "-0.998", "time": started_at,
+        }
+        histories = [[], [candidate], [candidate, dict(candidate, txid="candidate2")]]
+        reasons = [
+            "no matching wallet transaction",
+            "wallet candidates require manual verification: candidate1",
+            "wallet candidates require manual verification: candidate1, candidate2",
+        ]
+        with patch.object(tipbot.time, "time", return_value=started_at + 600):
+            for count, (history, reason) in enumerate(zip(histories, reasons), 1):
+                bot.reconcile_withdrawals(history)
+                self.assertEqual(sender["review_reason"], reason)
+                reported_at = sender["reviewReportedAt"]
+                bot.reconcile_withdrawals(list(reversed(history)))
+                self.assertEqual(sender["reviewReportedAt"], reported_at)
+                self.assertEqual(bot.send_to_logs.call_count, count)
+                bot.send_to_logs.assert_called_with(
+                    "Withdrawal withdraw:50 needs review: " + reason
+                )
+        self.assertTrue(sender["review_required"])
+        self.assertEqual(sender["status"], "unknown")
+        self.assertNotIn("txId", sender)
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 900_000_000)
+        self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 100_000_000)
+        self.assertEqual(bot.wallet_api.spendspark.call_count, 1)
+
     def test_transaction_rpc_requires_a_valid_confirmation_count(self):
         api = FiroWalletAPI("http://unused")
         for result in (None, {}, {"confirmations": False}, {"confirmations": "2"}):
