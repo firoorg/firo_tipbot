@@ -1,7 +1,8 @@
 {
     "mongo":
     {
-      "connectionString": "mongodb://localhost:27017/firo"
+      "connectionString": "mongodb://localhost:27017/firo?replicaSet=rs0",
+      "migrationConfirmedOffline": false
     },
     "telegram_bot":
     {
@@ -13,16 +14,16 @@
        "incorrect_parametrs": "Remember, I'm just a bot. I don't quite understand what you want me to do, so take a look at the /help section and get tipping",
        "incorrect_withdraw": "Please, use <pre>/withdraw [Firo address] [amount]</pre> to withdraw Firo to another wallet address.",
        "deposit": "Here is your Firo Tip Bot address: <pre>%s</pre> Send some Firo here to get tipping.",
-       "help": "<b>Welcome to Firo Tip Bot!</b>\n\n<b>My job is:</b>\n▲ To provide all the information you could possibly need relating to Firo\n▲ I'm also able to help you get tipping other valuable Firoers\n\nBelow is a list of commands that you can send to me, or to groups I'm in:\n \n<b>Commands for tipping with Firo Tip Bot:</b>\n- In channels with Firo Tip Bot:\n \n• send a tip to any user: /tip @[username] [amount]\n \n• send a tip to specific user by replying to his/her message with /tip [amount]\n\n- <b>Direct messaging to Firo Tip Bot</b>:\n \n• send a /tip @[username] [amount] to any user\n \n• send an anonymous tip with /atip @[username] [amount]\n \n• check your /balance anytime\n \n• see the /deposit address for your Telegram-bound wallet\n \n• transfer your funds to a more secure wallet /withdraw [FiroAddress] [amount]\n\n<b>WARNING: </b>\n- Firo Tip Bot is an experimental module, do not store large amounts in it!\n- Your funds are stored in a personal address, not in a personal wallet! It means, you can't have access the seed phrase or the wallet database.\n- We take no responsibility for any lost or stolen funds. By using Firo Tip Bot Bot, you fully accept the risk.\nTo keep your Firo safe, we recommend using Firo desktop and mobile wallets.\n\n<b>For Fun</b>:\n• /envelope [amount] - sends a red envelope to the group, where everyone can open and share the Firo\n\n",
-       "tip_help": "<b>Below are the commands for tipping with Firo Tip Bot</b>:\n\n<b>In channels with Firo Tip Bot</b>: \n- Reply to a message with /tip [amount] to send that user a tip\n- Or send them a tip outside of a reply with /tip @[username] [amount]\n\n<b>Direct messaging Firo Tip Bot</b>: \n- You can also send a /tip @[username] [amount] from here\n- Or you can send one anonymously with /atip @[username] [amount]\n- Check your /balance at anytime to see how many Firo you have\n- You can see your /deposit address, and send it some Firo for tipping\n- At any time you can /withdraw [FiroAddress] [amount] to a more secure wallet\n\n<b>WARNING</b>: Firo Tip Bot is experimental, do not store large sums in your address! Your Firo are stored in your personal address, not a personal wallet. For this reason there are no back up options for your wallet address. We take no responsibility for lost or stolen funds. By using Firo Tip Bot Tip Bot, you accept the risk.",
+       "help": "<b>Welcome to Firo Tip Bot!</b>\n\n<b>Commands</b>:\n• Reply to a Telegram message with /tip [amount]\n• Check your /balance\n• Show your /deposit address\n• Withdraw with /withdraw [FiroAddress] [amount]\n• Create a group red envelope with /envelope [amount]\n\nTips by @username are disabled because Telegram usernames can change. Use reply-to tipping so the stable Telegram user ID is used.\n\n<b>WARNING:</b> Firo Tip Bot is experimental. Do not store large amounts in it. Tipbot addresses share one custodial wallet and do not give users access to its seed phrase or wallet database.",
+       "tip_help": "<b>Reply to the recipient's Telegram message with:</b>\n<pre>/tip [amount]</pre>\n\nTips by @username are disabled because usernames can change ownership. Reply-to tipping uses the recipient's stable Telegram user ID.",
        "withdrawal_result": "<b>You withdrew %s Firo to</b>: <pre>%s</pre> ",
        "incorrect_balance": "<b>You don't have enough Firo to send this transaction!</b>\n<b>Your balance is: %s Firo</b>",
        "incorrect_amount": "Something isn't quite right with this command. Please check /help for the full list of commands.",
-       "username_error": "This username has not started using Firo Tip Bot! Please tell the user to message the bot with /start to get an address and get tipping",
+       "username_error": "This recipient has not started using Firo Tip Bot. Ask them to message the bot with /start before receiving tips.",
        "tip_received": "You received a %s <b>Firo tip</b> from <a href='tg://user?id=%s'>%s</a>. You must be doing something right!",
        "tip_sent": "You sent a tip of <b>%s</b> Firos to <a href='tg://user?id=%s'>%s</a>",
        "withdrawal_busy": "You have unconfirmed withdrawal. Please, wait for confirmations.",
-       "withdrawal_failed": "<b>Withdrawal failed. Try again in one minute...</b>"
+       "withdrawal_failed": "<b>Withdrawal failed. Check the bot response before trying again.</b>"
     },
     "httpprovider": "",
     "log_ch": ""

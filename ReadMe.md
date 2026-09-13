@@ -1,19 +1,26 @@
 ## How to deploy Firo Tip bot
 
+Use Ubuntu 22.04 or newer.
+
 Update Ubuntu packages
 <pre>sudo apt update</pre>
 <pre>sudo apt upgrade</pre>
-<pre>sudo apt-get install python3-dev python3-pip python3-virtualenv</pre>
+<pre>sudo apt-get install python3.10-dev python3-pip python3-virtualenv</pre>
+
+Python 3.10 or newer is required.
 
 Clone firo tip bot repo:
-<pre>git clone https://repo_link</pre>
+<pre>git clone https://github.com/firoorg/firo_tipbot.git</pre>
 <pre>cd firo_tipbot</pre>
 
 Install python requirement packages
-<pre>pip3 install -r requirements.txt</pre>
+<pre>python3.10 -m pip install -r requirements.txt</pre>
+
+Use Firo Core 0.14.15.1 or newer. Earlier versions can return an incorrect
+Spark address from `getsparkcoinaddr`.
 
 To check if the bot works correct:
-<pre>python3 tipbot.py</pre>
+<pre>python3.10 tipbot.py</pre>
 If there's not exceptions, use Ctrl+C to break the process.
 
 Configure TipBot init script
@@ -30,7 +37,7 @@ After=mongodb.service
 [Service]
 Type=simple
 WorkingDirectory=/root/firo_tipbot
-ExecStart=/usr/bin/python3 tipbot.py
+ExecStart=/usr/bin/python3.10 tipbot.py
 EnvironmentFile=/etc/environment
 RestartSec=10
 SyslogIdentifier=tipbot
@@ -62,13 +69,41 @@ To stop the service
 <pre>sudo systemctl stop tipbot.service</pre>
 
 ### Install Mongodb on ubuntu
-#### Follow this manual:
-https://www.digitalocean.com/community/tutorials/how-to-install-mongodb-on-ubuntu-18-04-source
 
-<pre>curl -fsSL https://www.mongodb.org/static/pgp/server-4.4.asc | sudo apt-key add -</pre>
-<pre>echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu bionic/mongodb-org/4.4 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-4.4.list</pre>
-<pre>sudo apt update</pre>
-<pre>sudo apt install mongodb-org</pre>
+Install MongoDB 6.0 or newer from the
+[official MongoDB installation guide](https://www.mongodb.com/docs/manual/administration/install-on-linux/).
+
+The tipbot uses MongoDB transactions for every multi-account balance change.
+Run MongoDB as a replica set, including on a single server. Add this to
+`/etc/mongod.conf`:
+
+<pre>
+replication:
+  replSetName: rs0
+</pre>
+
+Restart MongoDB and initialize the set once:
+
+<pre>sudo systemctl restart mongod</pre>
+<pre>mongosh --eval "rs.initiate()"</pre>
+
+Use a connection string containing `?replicaSet=rs0`, as shown in
+`services.json`. The bot refuses to start against standalone MongoDB because
+standalone writes cannot safely move funds between accounts.
+
+Before the first start of this version, stop every old tipbot process and take
+a MongoDB backup. Set `mongo.migrationConfirmedOffline` to `true` in
+`services.json`, then start one updated process first. It converts balances to
+integer groth, refunds the unclaimed remainder of legacy red envelopes, and
+quarantines legacy withdrawals that cannot be reconstructed safely. The bot
+refuses to migrate an existing database without this explicit confirmation. Do
+not run old and new bot versions against the same database during this
+migration. Reset the setting to `false` after the first successful start.
+
+The migration also replaces the old shared default deposit address. Users must
+request `/deposit` again before sending funds. A payment later sent to a retired
+shared address is stored as a `deposit-orphan` review record and logged for
+manual ownership checks. It is never assigned to an arbitrary user.
 
 Configure init script
 <pre>vim /etc/systemd/system/mongod.service</pre>
@@ -134,23 +169,23 @@ While still in root user on your VPS (or alternatively you can sudo within your 
 
 ## How to install Firo Wallet/Node on Ubuntu
 
-#### Download and unzip last release 
+#### Download and unpack Firo Core 0.14.15.1 or newer
 
-<code>wget https://github.com/firoorg/firo/releases/download/v0.14.6.0/firo-0.14.6.0-linux64.tar.gz | tar -xvf</code>
+Use the current Linux release from https://github.com/firoorg/firo/releases.
 
 #### Send files to binary folder
 
-<code>cd firo-0.14.6; cp bin/* /usr/local/bin</code>
+<code>cd firo-&lt;version&gt;; cp bin/* /usr/local/bin</code>
 
 #### Create config file
-nano /root/.firo/firo.config
+<pre>nano /root/.firo/firo.conf</pre>
 
 <pre>
 #----
 rpcuser=user
 rpcpassword=password
 rpcallowip=127.0.0.1
-rpcport=8332
+rpcport=8888
 #----
 listen=1
 server=1
@@ -335,6 +370,6 @@ spendzerocoin amount(1,10,25,50,100) ("firoaddress")
 
 #### Curl Request 
 
-<code>curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getbalance"}' http://user:password@127.0.0.1:8332</code>
+<code>curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getbalance"}' http://user:password@127.0.0.1:8888</code>
 
-<code> curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressbalance", "params": [{"addresses": ["XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg"]}] }' -H 'content-type: text/plain;' http://user:password@127.0.0.1:8332</code>
+<code> curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressbalance", "params": [{"addresses": ["XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg"]}] }' -H 'content-type: text/plain;' http://user:password@127.0.0.1:8888</code>
