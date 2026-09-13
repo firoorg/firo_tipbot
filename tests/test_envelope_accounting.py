@@ -115,6 +115,32 @@ class EnvelopeAccountingTests(unittest.TestCase):
         bot.create_send_tips_image.assert_not_called()
         bot.create_receive_tips_image.assert_not_called()
 
+    def test_tip_confirmations_handle_missing_recipient_name(self):
+        for profile, expected_name in (
+            ({}, "2"), ({"first_name": None}, "2"),
+            ({"first_name": ""}, "2"), ({"first_name": "Bob"}, "Bob"),
+        ):
+            with self.subTest(profile=profile):
+                bot = self.make_bot()
+                bot.col_users.documents[1].update(Balance=1.0, BalanceGroth=100_000_000)
+                bot.col_users.insert_one({
+                    "_id": 2, "Balance": 0.0, "BalanceGroth": 0,
+                    "IsVerified": True, **profile,
+                })
+
+                bot.send_tip(2, "0.25", None, "thanks")
+                bot.send_tip(2, "0.25", None, "thanks")
+
+                self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 75_000_000)
+                self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 25_000_000)
+                self.assertEqual(len(bot.col_tip_logs.documents), 1)
+                bot.create_send_tips_image.assert_called_once_with(
+                    1, "0.25000000", expected_name, "thanks",
+                )
+                bot.create_receive_tips_image.assert_called_once_with(
+                    2, "0.25000000", "Alice", "thanks",
+                )
+
     def test_full_depletion_conserves_groth_and_claim_replay_is_noop(self):
         bot = self.make_bot()
         bot.col_users.documents[1].update(Balance=0.003, BalanceGroth=300_000)

@@ -2165,7 +2165,7 @@ class TipBot:
         self.create_send_tips_image(
             self.user_id,
             "{0:.8f}".format(amount),
-            receiver['first_name'],
+            receiver.get('first_name') or str(user_id),
             comment,
         )
         self.create_receive_tips_image(
