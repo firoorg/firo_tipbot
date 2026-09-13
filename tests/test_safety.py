@@ -178,6 +178,16 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([call[0]["params"][2] for call in calls], [0, 2])
         self.assertTrue(all(call[1] == (3, 9) for call in calls))
 
+    def test_rpc_rejects_invalid_page_sizes_before_requesting(self):
+        api = FiroWalletAPI("http://unused")
+        api.session.post = Mock(side_effect=AssertionError("RPC must not be called"))
+        for page_size in (0, -1, True, 1.5, "2", None):
+            with self.subTest(page_size=page_size), self.assertRaisesRegex(
+                ValueError, "page_size must be a positive integer"
+            ):
+                api.get_txs_list(page_size=page_size)
+        api.session.post.assert_not_called()
+
     def test_rpc_error_body_survives_http_500(self):
         api = FiroWalletAPI("http://node")
         error = {"code": -4, "message": "Spark spend creation failed."}

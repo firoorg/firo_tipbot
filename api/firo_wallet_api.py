@@ -63,6 +63,8 @@ class FiroWalletAPI:
         return self._result("getsparkcoinaddr", [tx_hash])
 
     def get_txs_list(self, page_size=1000):
+        if type(page_size) is not int or page_size <= 0:
+            raise ValueError("page_size must be a positive integer")
         transactions = []
         skip = 0
 
