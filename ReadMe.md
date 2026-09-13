@@ -5,7 +5,7 @@ Use Ubuntu 22.04 or newer.
 Update Ubuntu packages
 <pre>sudo apt update</pre>
 <pre>sudo apt upgrade</pre>
-<pre>sudo apt-get install python3.10-dev python3-pip python3-virtualenv</pre>
+<pre>sudo apt-get install python3-dev python3-pip python3-virtualenv</pre>
 
 Python 3.10 or newer is required.
 
@@ -14,13 +14,13 @@ Clone firo tip bot repo:
 <pre>cd firo_tipbot</pre>
 
 Install python requirement packages
-<pre>python3.10 -m pip install -r requirements.txt</pre>
+<pre>python3 -m pip install -r requirements.txt</pre>
 
 Use Firo Core 0.14.15.1 or newer. Earlier versions can return an incorrect
 Spark address from `getsparkcoinaddr`.
 
 To check if the bot works correct:
-<pre>python3.10 tipbot.py</pre>
+<pre>python3 tipbot.py</pre>
 If there's not exceptions, use Ctrl+C to break the process.
 
 Configure TipBot init script
@@ -37,7 +37,7 @@ After=mongodb.service
 [Service]
 Type=simple
 WorkingDirectory=/root/firo_tipbot
-ExecStart=/usr/bin/python3.10 tipbot.py
+ExecStart=/usr/bin/python3 tipbot.py
 EnvironmentFile=/etc/environment
 RestartSec=10
 SyslogIdentifier=tipbot
@@ -99,6 +99,22 @@ quarantines legacy withdrawals that cannot be reconstructed safely. The bot
 refuses to migrate an existing database without this explicit confirmation. Do
 not run old and new bot versions against the same database during this
 migration. Reset the setting to `false` after the first successful start.
+
+Run one bot process per database. The bot claims a unique `bot_owner` document
+in the `state` collection before migration or recovery and releases it on a
+clean shutdown after the accounting worker stops. A second process refuses
+to start. After a crash or forced shutdown, stop and verify every bot process
+on every host before removing that stale document with
+`db.state.deleteOne({_id: "bot_owner"})` in the tipbot database. The record
+includes its host and process ID. Never remove it while a bot may still be
+running. Completed money migrations are not rerun on ordinary restarts.
+
+Withdrawals with an uncertain RPC outcome retain their reserved funds and
+are marked for review. Generic wallet errors can occur after a transaction
+was stored, so they cannot establish that a refund is safe. Address, amount,
+and time matches are logged as candidates for manual verification. They do
+not automatically settle a withdrawal. Reconcile these cases against the
+wallet before assigning a transaction ID or refunding funds.
 
 The migration also replaces the old shared default deposit address. Users must
 request `/deposit` again before sending funds. A payment later sent to a retired

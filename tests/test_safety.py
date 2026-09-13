@@ -336,7 +336,7 @@ class SafetyTests(unittest.TestCase):
             intent = bot.col_senders.documents["withdraw:11"]
             self.assertEqual((user["Balance"], user["Locked"]), (9.0, 1.0))
             self.assertEqual(intent["status"], "broadcasting")
-            self.assertEqual(amount, 0.998)
+            self.assertEqual(amount, "0.99800000")
             self.assertFalse(subtract_fee)
             return {"result": "txid", "error": None}
 
@@ -459,7 +459,7 @@ class SafetyTests(unittest.TestCase):
             },
             spendspark=lambda *args, **kwargs: {
                 "result": None,
-                "error": {"code": -4, "message": "Spark spend creation failed."},
+                "error": {"code": -13, "message": "Wallet is locked."},
             },
         )
 
@@ -874,7 +874,7 @@ class SafetyTests(unittest.TestCase):
             bot.col_senders.documents["withdraw:20"]["status"], "completed"
         )
 
-    def test_unknown_withdrawal_recovers_one_exact_wallet_match(self):
+    def test_unknown_withdrawal_requires_review_even_with_one_wallet_match(self):
         bot = tipbot.TipBot.__new__(tipbot.TipBot)
         started = tipbot.datetime.datetime.utcnow()
         started_at = tipbot.calendar.timegm(started.utctimetuple())
@@ -929,7 +929,10 @@ class SafetyTests(unittest.TestCase):
         bot.reconcile_withdrawals(history)
 
         sender = bot.col_senders.documents["withdraw:21"]
-        self.assertEqual((sender["status"], sender["txId"]), ("pending", "tx21"))
+        self.assertEqual(sender["status"], "unknown")
+        self.assertNotIn("txId", sender)
+        self.assertTrue(sender["review_required"])
+        self.assertIn("tx21", sender["review_reason"])
         self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 100_000_000)
 
     def test_legacy_lock_dust_is_removed_without_active_withdrawals(self):

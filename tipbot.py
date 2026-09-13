@@ -4,14 +4,19 @@
     If you'll need the support use the contacts ^(above)!
 """
 import asyncio
+import atexit
 import calendar
 import datetime
 import html
 import io
 import json
 import logging
+import os
 import re
 import secrets
+import signal
+import socket
+import sys
 import threading
 import time
 import traceback
@@ -26,7 +31,7 @@ from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
-from api.firo_wallet_api import FiroTransportError, FiroWalletAPI
+from api.firo_wallet_api import FiroRPCError, FiroTransportError, FiroWalletAPI
 
 logger = logging.getLogger()
 logger.setLevel(logging.ERROR)
@@ -192,8 +197,13 @@ class TipBot:
         self.col_envelopes = db['envelopes']
         self.col_txs = db['txs']
         self.col_state = db['state']
-        self.col_senders.create_index("txId", unique=True, sparse=True)
+        self.stop_jobs = threading.Event()
+        self.scheduler_thread = None
+        self.claim_process_ownership()
         self.require_offline_migration_confirmation()
+        # Legacy failed RPCs stored explicit null IDs, which sparse indexes include.
+        self.col_senders.update_many({"txId": None}, {"$unset": {"txId": ""}})
+        self.col_senders.create_index("txId", unique=True, sparse=True)
         self.migrate_deposit_addresses()
         self.col_users.create_index(
             "Address",
@@ -223,7 +233,8 @@ class TipBot:
         schedule.every(300).seconds.do(
             self.safe_job, "automint", self.wallet_api.automintunspent
         )
-        threading.Thread(target=self.pending_tasks, daemon=True).start()
+        self.scheduler_thread = threading.Thread(target=self.pending_tasks, daemon=True)
+        self.scheduler_thread.start()
 
         while True:
             try:
@@ -235,6 +246,36 @@ class TipBot:
             except Exception as exc:
                 print(exc)
                 traceback.print_exc()
+
+    def claim_process_ownership(self):
+        self.owner_id = uuid.uuid4().hex
+        atexit.register(self.release_process_ownership)
+        try:
+            self.col_state.insert_one(
+                {
+                    "_id": "bot_owner",
+                    "owner_id": self.owner_id,
+                    "host": socket.gethostname(),
+                    "pid": os.getpid(),
+                    "started_at": datetime.datetime.utcnow(),
+                }
+            )
+        except DuplicateKeyError as exc:
+            raise RuntimeError(
+                "another bot owns this database; after verifying every bot process "
+                "has stopped, remove a stale state.bot_owner record before restarting"
+            ) from exc
+
+    def release_process_ownership(self):
+        self.stop_jobs.set()
+        if self.scheduler_thread is not None:
+            self.scheduler_thread.join(timeout=5)
+            if self.scheduler_thread.is_alive():
+                return  # Leave ownership in place while accounting work can still run.
+        try:
+            self.col_state.delete_one({"_id": "bot_owner", "owner_id": self.owner_id})
+        except Exception:
+            logger.exception("could not release bot database ownership")
 
     def safe_job(self, name, job):
         try:
@@ -269,6 +310,8 @@ class TipBot:
     def require_offline_migration_confirmation(self):
         state = self.col_state.find_one({"_id": "money_schema"})
         if state and state.get("status") == "complete":
+            if state.get("version") != 1:
+                raise RuntimeError("unsupported completed money schema version")
             return
         has_existing_data = any(
             collection.find_one({}) is not None
@@ -350,6 +393,11 @@ class TipBot:
                 owners[address] = user["_id"]
 
     def migrate_money_schema(self):
+        state = self.col_state.find_one({"_id": "money_schema"})
+        if state and state.get("status") == "complete":
+            if state.get("version") != 1:
+                raise RuntimeError("unsupported completed money schema version")
+            return
         for user in self.col_users.find({}):
             balance_groth = user.get("BalanceGroth")
             locked_groth = user.get("LockedGroth")
@@ -764,12 +812,11 @@ class TipBot:
         )
 
     def pending_tasks(self):
-        while True:
+        while not self.stop_jobs.wait(5):
             try:
                 schedule.run_pending()
             except Exception:
                 logger.exception("scheduled task dispatcher failed")
-            time.sleep(5)
 
     def processing_messages(self, new_messages):
         for self.new_message in new_messages:
@@ -955,7 +1002,7 @@ class TipBot:
                 return
             self.send_message(
                 self.user_id,
-                dictionary['balance'] % "{0:.8f}".format(float(self.balance_in_firo)),
+                dictionary['balance'] % format_groth(self.balance_in_groth),
                 parse_mode='HTML'
             )
 
@@ -1084,7 +1131,12 @@ class TipBot:
         ):
             entries = transactions.get(event["txId"])
             if not entries:
-                continue
+                # Conflicted incoming transactions can disappear from listtransactions.
+                response = self.wallet_api.get_tx_status(event["txId"])
+                if response.get("error"):
+                    raise RuntimeError(response["error"])
+                entries = [response["result"]]
+                transactions[event["txId"]] = entries
             confirmations = max(entry.get("confirmations", 0) for entry in entries)
             final = (
                 confirmations >= 2
@@ -1343,39 +1395,12 @@ class TipBot:
             if assigned is None or assigned["_id"] == sender["_id"]:
                 candidates.add(txid)
 
-        if len(candidates) == 1:
-            txid = candidates.pop()
-            recovered = self.col_senders.update_one(
-                {
-                    "_id": sender["_id"],
-                    "status": {"$in": ["broadcasting", "unknown"]},
-                    "txId": {"$exists": False},
-                },
-                {
-                    "$set": {
-                        "txId": txid,
-                        "status": "pending",
-                        "recovered_at": datetime.datetime.utcnow(),
-                    },
-                    "$unset": {
-                        "review_required": "",
-                        "review_reason": "",
-                        "reviewReportedAt": "",
-                    },
-                },
-            )
-            if recovered.modified_count == 1:
-                self.send_to_logs(
-                    "Recovered transaction id %s for withdrawal %s"
-                    % (txid, sender["_id"])
-                )
-            return
-
-        if time.time() - started_at >= 300:
+        # Address, amount and time cannot prove which command created a transaction.
+        if candidates or time.time() - started_at >= 300:
             reason = (
                 "no matching wallet transaction"
                 if not candidates
-                else "multiple matching wallet transactions: %s"
+                else "wallet candidates require manual verification: %s"
                 % ", ".join(sorted(candidates))
             )
             self.report_withdrawal_once(sender, reason)
@@ -1672,8 +1697,8 @@ class TipBot:
             user = self.col_users.find_one({"_id": self.user_id})
         return (
             normalize_addresses(user.get('Address')),
-            groth_to_float(user['BalanceGroth']),
-            groth_to_float(user['LockedGroth']),
+            groth_to_decimal(user['BalanceGroth']),
+            groth_to_decimal(user['LockedGroth']),
             user['IsWithdraw'],
         )
 
@@ -1833,7 +1858,6 @@ class TipBot:
         current = self.col_senders.find_one({"_id": intent_id})
         address = current["address"]
         send_amount_groth = current["send_amount_groth"]
-        send_amount = groth_to_float(send_amount_groth)
         comment = current.get("comment", "")
         broadcasting = self.col_senders.update_one(
             {"_id": intent_id, "status": "reserved"},
@@ -1855,11 +1879,19 @@ class TipBot:
         try:
             response = self.wallet_api.spendspark(
                 address,
-                send_amount,
+                format_groth(send_amount_groth),
                 comment,
                 subtract_fee=False,
             )
-        except FiroTransportError as exc:
+            error = response.get("error")
+            # Core can persist a spend before reporting a generic wallet error.
+            # Only these validation/unlock/dispatch errors prove no spend was made.
+            if error and (
+                not isinstance(error, dict)
+                or error.get("code") not in {-3, -5, -8, -13, -32601}
+            ):
+                raise FiroRPCError(error)
+        except (FiroTransportError, FiroRPCError) as exc:
             self.col_senders.update_one(
                 {"_id": intent_id, "status": "broadcasting"},
                 {
@@ -1872,19 +1904,27 @@ class TipBot:
             )
             self.send_message(
                 self.user_id,
-                "<b>The node response was interrupted. Your funds remain locked while the transaction is checked. Do not retry.</b>",
+                "<b>The withdrawal outcome is uncertain. Your funds remain locked for review. Do not retry.</b>",
                 parse_mode='HTML',
             )
             self.send_to_logs("Ambiguous withdrawal %s: %s" % (intent_id, exc))
             return
 
         if response.get('error'):
+            rejected = self.col_senders.update_one(
+                {"_id": intent_id, "status": "broadcasting"},
+                {"$set": {"status": "rejected", "error": response["error"]}},
+            )
+            if rejected.modified_count != 1:
+                raise RuntimeError("withdrawal rejection could not be recorded")
             refunded = self.refund_withdrawal(
                 intent_id,
                 response["error"],
-                allowed_statuses=["broadcasting"],
+                allowed_statuses=["rejected"],
             )
-            if not refunded:
+            if not refunded and not self.col_senders.find_one(
+                {"_id": intent_id, "status": "failed"}
+            ):
                 raise RuntimeError("withdrawal rejection could not be refunded")
             self.send_message(
                 self.user_id,
@@ -2426,6 +2466,8 @@ class TipBot:
         }
 
         def reserve(session):
+            if self.col_envelopes.find_one({"_id": envelope_id}, session=session):
+                return True
             debited = self.col_users.update_one(
                 {
                     "_id": self.user_id,
@@ -2448,6 +2490,9 @@ class TipBot:
         try:
             reserved = self.run_transaction(reserve)
         except DuplicateKeyError:
+            reserved = True
+
+        if reserved:
             existing = self.col_envelopes.find_one({"_id": envelope_id})
             if existing and existing.get("status") == "rejected":
                 self.refund_envelope(envelope_id, existing.get("error"))
@@ -2459,7 +2504,6 @@ class TipBot:
                     {"_id": envelope_id, "status": "sending"},
                     {"$set": {"status": "creating"}},
                 )
-            reserved = True
 
         if not reserved:
             sender = self.col_users.find_one({"_id": self.user_id})
@@ -2863,6 +2907,7 @@ class TipBot:
 
 
 def main():
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         TipBot(wallet_api)
 

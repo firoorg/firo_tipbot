@@ -93,7 +93,15 @@ class FiroWalletAPI:
         return self._rpc("getinfo", request_id=6)
 
     def get_tx_status(self, tx_id):
-        return self._rpc("gettransaction", [tx_id], request_id=4)
+        response = self._rpc("gettransaction", [tx_id], request_id=4)
+        if not response.get("error"):
+            transaction = response["result"]
+            if (
+                not isinstance(transaction, dict)
+                or type(transaction.get("confirmations")) is not int
+            ):
+                raise FiroTransportError("gettransaction returned no valid confirmation count")
+        return response
 
     def automintunspent(self):
         return self._result("automintspark", request_id=4)
