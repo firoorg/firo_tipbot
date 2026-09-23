@@ -4,13 +4,13 @@ from unittest.mock import Mock
 
 import tipbot
 from api.firo_wallet_api import FiroTransportError
-from test_safety import MemoryCollection, transaction_runner
+from test_safety import MemoryCollection, ready_bot, transaction_runner
 
 
 class AccountingTests(unittest.TestCase):
     @staticmethod
     def deposit_bot():
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection([{"_id": 1, "Balance": 10.0}])
         bot.col_txs = MemoryCollection(
             [
@@ -58,6 +58,26 @@ class AccountingTests(unittest.TestCase):
             bot.col_txs.documents["deposit:tx:address"]["status"], "confirmed"
         )
 
+    def test_reorg_deficit_pauses_recipient_withdrawals(self):
+        bot = self.deposit_bot()
+        bot.col_users.documents[1].update(Balance=0.0, BalanceGroth=0)
+        bot.col_users.insert_one({"_id": 2, "Balance": 1.0, "BalanceGroth": 100_000_000})
+        bot.wallet_api.get_tx_status.return_value = {
+            "result": {"confirmations": -1, "chainlock": False}, "error": None,
+        }
+
+        bot.reconcile_deposit_confirmations({})
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], -100_000_000)
+        self.assertTrue(bot.outgoing_paused())
+
+        bot.user_id = 2
+        bot.send_message = Mock()
+        bot.wallet_api.validate_address = Mock()
+        bot.wallet_api.spendspark = Mock()
+        bot.withdraw_coins("external", "0.5")
+        bot.wallet_api.validate_address.assert_not_called()
+        bot.wallet_api.spendspark.assert_not_called()
+
     def test_missing_deposit_rpc_failure_preserves_credit_and_continues(self):
         for transport_failure in (False, True):
             with self.subTest(transport_failure=transport_failure):
@@ -86,6 +106,7 @@ class AccountingTests(unittest.TestCase):
                     bot.col_txs.documents["deposit:tx:address"]["status"],
                     "confirmed",
                 )
+                self.assertTrue(bot.outgoing_paused())
                 event = bot.col_txs.documents["deposit:tx:address"]
                 self.assertTrue(event["review_required"])
                 self.assertIn(
@@ -113,12 +134,48 @@ class AccountingTests(unittest.TestCase):
                     bot.update_balance()
                 self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 800_000_000)
                 self.assertEqual(event["status"], "reversed")
+                self.assertFalse(bot.outgoing_paused())
                 self.assertNotIn("review_required", event)
                 self.assertNotIn("review_reason", event)
                 self.assertNotIn("reviewReportedAt", event)
 
+    def test_empty_spark_output_is_retried_before_marking_scan_complete(self):
+        bot = ready_bot()
+        outputs = []
+        bot.wallet_api = SimpleNamespace(get_spark_coin_address=lambda txid: outputs)
+        bot.col_users = MemoryCollection(
+            [{"_id": 1, "Address": ["address"], "Balance": 0.0}]
+        )
+        bot.col_txs = MemoryCollection()
+        bot.col_state = MemoryCollection()
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
+        bot.create_receive_tips_image = Mock()
+        transaction = {"txid": "tx", "category": "receive", "confirmations": 2}
+
+        bot.apply_deposits(transaction)
+        self.assertNotIn("deposit-scan:tx", bot.col_txs.documents)
+        outputs.append({"address": "address", "amount": 0})
+        bot.apply_deposits(transaction)
+        self.assertNotIn("deposit-scan:tx", bot.col_txs.documents)
+        outputs.append({"address": "address", "amount": 1.0})
+        bot.apply_deposits(transaction)
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 100_000_000)
+        self.assertIn("deposit-scan:tx", bot.col_txs.documents)
+
+    def test_failed_reconciliation_pauses_outgoing_funds(self):
+        bot = ready_bot()
+        bot.reconciliation_ok = True
+        bot.col_txs = MemoryCollection()
+        bot.wallet_api = SimpleNamespace(
+            get_txs_list=Mock(side_effect=FiroTransportError("wallet offline"))
+        )
+
+        with self.assertRaises(FiroTransportError):
+            bot.update_balance()
+        self.assertTrue(bot.outgoing_paused())
+
     def test_completed_money_migration_does_not_access_account_collections(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         state = {"_id": "money_schema", "version": 1, "status": "complete"}
         bot.col_state = MemoryCollection([state])
 
@@ -127,7 +184,7 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(bot.col_state.documents["money_schema"], state)
 
     def test_legacy_money_migration_creates_missing_integer_fields(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [{"_id": 1, "Balance": 0.30000000000000004, "Locked": 0.0}]
         )

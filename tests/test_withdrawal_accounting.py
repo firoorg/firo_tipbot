@@ -5,13 +5,13 @@ from unittest.mock import Mock, patch
 
 import tipbot
 from api.firo_wallet_api import FiroTransportError, FiroWalletAPI
-from test_safety import MemoryCollection, transaction_runner
+from test_safety import MemoryCollection, ready_bot, transaction_runner
 
 
 class WithdrawalAccountingTests(unittest.TestCase):
     @staticmethod
     def withdrawal_bot(error=None):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=50)
         bot.col_users = MemoryCollection([
@@ -65,7 +65,7 @@ class WithdrawalAccountingTests(unittest.TestCase):
         bot.col_users.documents[1].update(Balance=100_000_000.0, BalanceGroth=10_000_000_000_000_000)
         bot.withdraw_coins("external", "99999999.00200001")
         bot.wallet_api.spendspark.assert_called_once_with(
-            "external", "99999999.00000001", "", subtract_fee=False,
+            "external", "99999999.00000001", "", subtract_fee=True,
         )
         self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 99_799_999)
         self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 9_999_999_900_200_001)
@@ -88,7 +88,7 @@ class WithdrawalAccountingTests(unittest.TestCase):
         started_at = tipbot.calendar.timegm(sender["broadcast_started_at"].utctimetuple())
         candidate = {
             "txid": "candidate1", "category": "spend", "address": "external",
-            "amount": "-0.998", "time": started_at,
+            "amount": "-0.9975", "fee": "-0.0005", "time": started_at,
         }
         histories = [[], [candidate], [candidate, dict(candidate, txid="candidate2")]]
         reasons = [
@@ -134,7 +134,7 @@ class WithdrawalAccountingTests(unittest.TestCase):
 class ProcessOwnershipTests(unittest.TestCase):
     @staticmethod
     def owner_bot(state=None):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_state = state if state is not None else MemoryCollection()
         bot.stop_jobs = threading.Event()
         bot.scheduler_thread = None

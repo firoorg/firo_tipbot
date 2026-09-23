@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 import requests
 
 
@@ -28,7 +30,7 @@ class FiroWalletAPI:
                 json=payload,
                 timeout=self.timeout,
             )
-            result = response.json()
+            result = response.json(parse_float=Decimal)
         except (requests.RequestException, ValueError) as exc:
             raise FiroTransportError(
                 "Firo RPC transport returned no usable response"

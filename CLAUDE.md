@@ -10,7 +10,6 @@ Firo Tipbot is a **Telegram bot** that enables users to send and receive Firo cr
 tipbot.py                  # Main application — TipBot class + main() entry point (~1350 lines)
 api/firo_wallet_api.py     # Firo JSON-RPC wrapper (FiroWalletAPI class)
 services.json              # Configuration (MongoDB, bot token, RPC endpoint, i18n strings)
-update_address.py          # Utility script for batch Spark address migration
 images/                    # Template PNG images for tip/deposit confirmation UI
 fonts/                     # ProximaNova TrueType fonts for image generation
 ```
@@ -115,7 +114,7 @@ All configuration is in `services.json` (not environment variables):
 - The bot is a **single-threaded polling loop** — blocking calls halt message processing
 - Tips are **off-chain** (database-only); only deposits and withdrawals touch the blockchain
 - User addresses are stored as arrays in the `Address` field (supports address migration)
-- The `update_address_and_balance()` method validates Spark addresses and creates new ones if needed
+- Startup migrates shared Spark addresses; `/deposit` validates and refreshes a user's address
 - No test suite exists — test changes manually against a testnet node (see `Testnet.md`)
 
 ### Files you should not modify without care

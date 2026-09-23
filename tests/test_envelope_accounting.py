@@ -4,12 +4,12 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import tipbot
-from test_safety import MemoryCollection, Result, transaction_runner
+from test_safety import MemoryCollection, ready_bot, Result, transaction_runner
 
 
 class EnvelopeAccountingTests(unittest.TestCase):
     def make_bot(self, status=None):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.group_id = -100
@@ -77,6 +77,26 @@ class EnvelopeAccountingTests(unittest.TestCase):
                 bot.insufficient_balance_image.assert_not_called()
                 self.assertEqual(len(bot.col_envelopes.documents), 1)
 
+    def test_paused_replay_finishes_previously_reserved_envelope(self):
+        bot = self.make_bot("sending")
+        bot.reconciliation_ok = False
+
+        bot.create_red_envelope("0.003")
+
+        self.assertEqual(bot.col_envelopes.documents["envelope:42"]["status"], "active")
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
+
+    def test_missing_envelope_image_refunds_reservation(self):
+        bot = self.make_bot()
+        bot.col_users.documents[1].update(Balance=0.003, BalanceGroth=300_000)
+        bot.red_envelope_created = tipbot.TipBot.red_envelope_created.__get__(bot)
+
+        with patch.object(tipbot.Image, "open", side_effect=OSError("missing image")):
+            bot.create_red_envelope("0.003")
+
+        self.assertEqual(bot.col_envelopes.documents["envelope:42"]["status"], "failed")
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 300_000)
+
     def test_claimant_failure_rolls_back_envelope_debit(self):
         bot = self.make_bot("active")
         bot.col_envelopes.documents["envelope:42"]["msg_id"] = 77
@@ -90,6 +110,21 @@ class EnvelopeAccountingTests(unittest.TestCase):
         self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
         self.assertEqual(bot.col_tip_logs.documents, {})
         bot.red_envelope_catched.assert_not_called()
+
+    def test_legacy_withdrawal_quarantine_blocks_existing_envelope_claim(self):
+        bot = self.make_bot("active")
+        bot.col_envelopes.documents["envelope:42"]["msg_id"] = 77
+        bot.col_users.documents[1]["WithdrawalQuarantined"] = True
+        bot.col_users.insert_one({
+            "_id": 2, "Balance": 0.0, "BalanceGroth": 0, "IsVerified": True,
+        })
+        self.set_claimant(bot, 2)
+
+        bot.catch_envelope("envelope:42")
+
+        self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 0)
+        self.assertEqual(bot.col_envelopes.documents["envelope:42"]["remains_groth"], 300_000)
+        bot.answer_call_back.assert_called_once()
 
     def test_tip_recipient_failure_rolls_back_sender_debit(self):
         bot = self.make_bot()

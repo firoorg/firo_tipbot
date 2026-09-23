@@ -1,5 +1,6 @@
 import copy
 import unittest
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -73,6 +74,9 @@ class MemoryCollection:
             elif isinstance(expected, dict) and "$gte" in expected:
                 if actual is None or actual < expected["$gte"]:
                     return False
+            elif isinstance(expected, dict) and "$lt" in expected:
+                if actual is None or actual >= expected["$lt"]:
+                    return False
             elif isinstance(expected, dict) and "$ne" in expected:
                 values = actual if isinstance(actual, list) else [actual]
                 if expected["$ne"] in values:
@@ -126,6 +130,15 @@ class MemoryCollection:
         return Result(0)
 
 
+def ready_bot():
+    bot = tipbot.TipBot.__new__(tipbot.TipBot)
+    bot.reconciliation_ok = True
+    bot.col_txs = MemoryCollection()
+    bot.col_users = MemoryCollection()
+    bot.col_state = MemoryCollection()
+    return bot
+
+
 def transaction_runner(*collections):
     def run(callback):
         snapshots = [copy.deepcopy(collection.documents) for collection in collections]
@@ -144,7 +157,7 @@ class FakeResponse:
         self.payload = payload
         self.status_error = status_error
 
-    def json(self):
+    def json(self, **kwargs):
         return self.payload
 
     def raise_for_status(self):
@@ -161,7 +174,7 @@ class SafetyTests(unittest.TestCase):
                 tipbot.main()
 
     def test_existing_user_commands_survive_wallet_outage(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.bot_username = "firo_tipbot"
         bot.col_users = MemoryCollection([{
             "_id": 1, "Address": ["deposit"], "Balance": 1.25,
@@ -204,7 +217,7 @@ class SafetyTests(unittest.TestCase):
             (None, [], None),
         ):
             with self.subTest(user=user, replacements=replacements):
-                bot = tipbot.TipBot.__new__(tipbot.TipBot)
+                bot = ready_bot()
                 bot.bot_username = "firo_tipbot"
                 bot.user_id = 1
                 bot._is_user_in_db = True
@@ -293,7 +306,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_deposit_output_order_is_irrelevant_and_replay_safe(self):
         def run(outputs):
-            bot = tipbot.TipBot.__new__(tipbot.TipBot)
+            bot = ready_bot()
             bot.wallet_api = SimpleNamespace(
                 get_spark_coin_address=lambda txid: outputs
             )
@@ -309,7 +322,7 @@ class SafetyTests(unittest.TestCase):
             bot.col_txs = MemoryCollection()
             bot.col_state = MemoryCollection()
             bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
-            bot.create_receive_tips_image = lambda *args: None
+            bot.create_receive_tips_image = lambda *args, **kwargs: None
             bot.send_to_logs = lambda *args: None
 
             transaction = {
@@ -331,7 +344,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(run([user_output, change_output]), (9.9979, 1))
 
     def test_retired_shared_address_deposit_is_recorded_for_review(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.wallet_api = SimpleNamespace(
             get_spark_coin_address=lambda txid: [
                 {"address": "retired", "amount": 1.0}
@@ -359,8 +372,25 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(bot.col_txs.documents["deposit-scan:orphan"]["orphaned"])
         bot.send_to_logs.assert_called_once()
 
+    def test_unassigned_wallet_output_is_recorded_for_review(self):
+        bot = ready_bot()
+        bot.wallet_api = SimpleNamespace(
+            get_spark_coin_address=lambda txid: [
+                {"address": "unassigned", "amount": 0.5}
+            ]
+        )
+        bot.col_state = MemoryCollection()
+        bot.send_to_logs = Mock()
+
+        bot.apply_deposits({"txid": "unassigned-tx"})
+
+        orphan = bot.col_txs.documents["deposit-orphan:unassigned-tx:unassigned"]
+        self.assertEqual(orphan["amount_groth"], 50_000_000)
+        self.assertTrue(bot.col_txs.documents["deposit-scan:unassigned-tx"]["orphaned"])
+        bot.send_to_logs.assert_called_once()
+
     def test_invalid_address_never_calls_spendspark(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=10)
         bot.wallet_api = SimpleNamespace(
@@ -378,7 +408,7 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("incorrect address", bot.send_message.call_args.args[1])
 
     def test_tipbot_deposit_address_never_calls_spendspark(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=10)
         bot.col_users = MemoryCollection(
@@ -398,8 +428,8 @@ class SafetyTests(unittest.TestCase):
         bot.wallet_api.spendspark.assert_not_called()
         self.assertIn("belongs to the tipbot", bot.send_message.call_args.args[1])
 
-    def test_withdrawal_is_reserved_before_broadcast_and_fee_is_not_subtracted_twice(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+    def test_withdrawal_is_reserved_before_broadcast_and_network_fee_comes_from_output(self):
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=11)
         bot.col_users = MemoryCollection(
@@ -425,7 +455,7 @@ class SafetyTests(unittest.TestCase):
             self.assertEqual((user["Balance"], user["Locked"]), (9.0, 1.0))
             self.assertEqual(intent["status"], "broadcasting")
             self.assertEqual(amount, "0.99800000")
-            self.assertFalse(subtract_fee)
+            self.assertTrue(subtract_fee)
             return {"result": "txid", "error": None}
 
         bot.wallet_api = SimpleNamespace(
@@ -442,7 +472,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(bot.col_senders.documents["withdraw:11"]["txId"], "txid")
 
     def test_start_never_resets_existing_money(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.username = "Alice"
@@ -470,8 +500,25 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(user["Address"], ["deposit"])
         bot.wallet_api.create_user_wallet.assert_not_called()
 
+    def test_start_rejects_empty_wallet_address(self):
+        for addresses in ([], ["retired"]):
+            with self.subTest(addresses=addresses):
+                bot = ready_bot()
+                bot.user_id = 1
+                bot.first_name = "Alice"
+                bot.username = None
+                bot.col_state = MemoryCollection([{
+                    "_id": "retired_deposit_addresses", "addresses": ["retired"],
+                }])
+                bot.wallet_api = SimpleNamespace(create_user_wallet=lambda: addresses)
+
+                with patch.object(tipbot.traceback, "print_exc"), patch("builtins.print"):
+                    with self.assertRaisesRegex(RuntimeError, "no deposit address"):
+                        bot.auth_user()
+                self.assertEqual(bot.col_users.documents, {})
+
     def test_transport_failure_stays_locked_and_cannot_rebroadcast(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=12)
         bot.col_users = MemoryCollection(
@@ -509,7 +556,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(spendspark.call_count, 1)
 
     def test_channel_reply_tip_is_rejected_without_stalling(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.message = SimpleNamespace(
             reply_to_message=SimpleNamespace(from_user=None)
@@ -521,7 +568,7 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("Telegram user", bot.send_message.call_args.args[1])
 
     def test_explicit_rpc_rejection_refunds_once(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=13)
         bot.col_users = MemoryCollection(
@@ -564,7 +611,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(bot.col_senders.documents["withdraw:13"]["status"], "failed")
 
     def test_replaying_tip_update_does_not_transfer_twice(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.new_message = SimpleNamespace(update_id=14)
@@ -585,6 +632,7 @@ class SafetyTests(unittest.TestCase):
             ]
         )
         bot.col_tip_logs = MemoryCollection()
+        bot.col_txs = MemoryCollection()
         bot.run_transaction = transaction_runner(bot.col_users, bot.col_tip_logs)
         bot.send_message = Mock()
         bot.insufficient_balance_image = Mock()
@@ -600,7 +648,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(bot.col_tip_logs.documents), 1)
 
     def test_repeated_decimal_tips_use_exact_groth_guards(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.col_users = MemoryCollection(
@@ -638,7 +686,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(bot.col_tip_logs.documents), 3)
 
     def test_plain_text_cannot_claim_envelope(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 2
         bot.new_message = SimpleNamespace(callback_query=None)
         bot.col_envelopes = MemoryCollection(
@@ -663,7 +711,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(bot.col_envelopes.documents["envelope:1"]["remains"], 1.0)
 
     def test_replayed_sending_envelope_does_not_debit_twice(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.group_id = -100
@@ -702,7 +750,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual((envelope["status"], envelope["msg_id"]), ("active", 77))
 
     def test_withdrawal_confirmation_clears_exact_reserved_amount(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -743,7 +791,7 @@ class SafetyTests(unittest.TestCase):
         )
 
     def test_reserved_withdrawal_replay_does_not_debit_or_broadcast_twice(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.new_message = SimpleNamespace(update_id=17)
         bot.col_users = MemoryCollection(
@@ -798,7 +846,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(spendspark.call_count, 1)
 
     def test_processing_messages_returns_false_when_handler_fails(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [{"_id": 1, "Balance": 1.0, "IsVerified": True}]
         )
@@ -827,8 +875,16 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(result)
         bot.action_processing.assert_called_once_with("/tip", ["1"])
 
+    def test_unsupported_update_is_acknowledged_without_stalling(self):
+        bot = ready_bot()
+        bot.get_action = Mock()
+        update = SimpleNamespace(message=None, callback_query=None, effective_user=None)
+
+        self.assertTrue(bot.processing_messages([update]))
+        bot.get_action.assert_not_called()
+
     def test_confirmed_deposit_reverses_below_two_confirmations(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -865,7 +921,7 @@ class SafetyTests(unittest.TestCase):
         )
 
     def test_missing_chainlock_does_not_reverse_a_deep_confirmed_deposit(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [{"_id": 1, "Address": ["deposit"], "Balance": 10.0}]
         )
@@ -884,6 +940,7 @@ class SafetyTests(unittest.TestCase):
             ]
         )
         bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
+        bot.send_to_logs = Mock()
 
         bot.reconcile_deposit_confirmations(
             {"tx19": [{"confirmations": 100, "chainlock": False}]}
@@ -894,9 +951,14 @@ class SafetyTests(unittest.TestCase):
             bot.col_txs.documents["deposit:tx19:deposit"]["status"],
             "confirmed",
         )
+        self.assertTrue(bot.outgoing_paused())
+        bot.reconcile_deposit_confirmations(
+            {"tx19": [{"confirmations": 101, "chainlock": True}]}
+        )
+        self.assertFalse(bot.outgoing_paused())
 
     def test_completed_withdrawal_reorg_relocks_and_recompletion_clears(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -963,7 +1025,7 @@ class SafetyTests(unittest.TestCase):
         )
 
     def test_unknown_withdrawal_requires_review_even_with_one_wallet_match(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         started = tipbot.datetime.datetime.utcnow()
         started_at = tipbot.calendar.timegm(started.utctimetuple())
         bot.col_users = MemoryCollection(
@@ -1024,7 +1086,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 100_000_000)
 
     def test_legacy_lock_dust_is_removed_without_active_withdrawals(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -1056,7 +1118,7 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(user["IsWithdraw"])
 
     def test_existing_database_requires_offline_migration_confirmation(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection([{"_id": 1, "Balance": 1.0}])
         bot.col_senders = MemoryCollection()
         bot.col_envelopes = MemoryCollection()
@@ -1073,8 +1135,20 @@ class SafetyTests(unittest.TestCase):
         ):
             bot.require_offline_migration_confirmation()
 
+    def test_untracked_legacy_deposit_blocks_even_completed_migration(self):
+        bot = ready_bot()
+        bot.col_state = MemoryCollection(
+            [{"_id": "money_schema", "status": "complete", "version": 1}]
+        )
+        bot.col_txs = MemoryCollection(
+            [{"_id": "legacy", "txId": "tx", "type": "deposit", "amount": 1.0}]
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "legacy deposits"):
+            bot.require_offline_migration_confirmation()
+
     def test_legacy_envelope_refund_reads_remainder_inside_transaction(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection([{"_id": 1, "Balance": 0.0}])
         bot.col_envelopes = MemoryCollection(
             [
@@ -1104,7 +1178,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(envelope["status"], "legacy_refunded")
 
     def test_unresolved_legacy_withdrawal_quarantines_zero_lock_user(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -1146,7 +1220,7 @@ class SafetyTests(unittest.TestCase):
         )
 
     def test_lock_release_preserves_legacy_withdrawal_quarantine(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {
@@ -1166,7 +1240,7 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(user["IsWithdraw"])
 
     def test_quarantined_user_cannot_move_balance_through_tips(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 1
         bot.first_name = "Alice"
         bot.new_message = SimpleNamespace(update_id=33)
@@ -1187,6 +1261,7 @@ class SafetyTests(unittest.TestCase):
             ]
         )
         bot.col_tip_logs = MemoryCollection()
+        bot.col_txs = MemoryCollection()
         bot.run_transaction = transaction_runner(
             bot.col_users, bot.col_tip_logs
         )
@@ -1198,10 +1273,65 @@ class SafetyTests(unittest.TestCase):
 
         self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 1_000_000_000)
         self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 0)
-        self.assertIn("frozen", bot.send_message.call_args.args[1])
+        self.assertIn("paused", bot.send_message.call_args.args[1])
+
+        bot.col_users.documents[1]["WithdrawalQuarantined"] = False
+        bot.col_txs.insert_one({
+            "_id": "deposit:missing", "type": "deposit", "status": "confirmed",
+            "review_required": True,
+        })
+        bot.send_tip(2, "10", None, "")
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 1_000_000_000)
+        self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 0)
+
+    def test_deposit_review_pauses_withdrawals_and_envelope_claims(self):
+        bot = ready_bot()
+        bot.user_id = 2
+        bot.col_txs = MemoryCollection([{
+            "_id": "deposit:missing", "type": "deposit", "status": "confirmed",
+            "review_required": True,
+        }])
+        bot.wallet_api = SimpleNamespace(validate_address=Mock(), spendspark=Mock())
+        bot.send_message = Mock()
+        bot.withdraw_coins("external", "1")
+        bot.wallet_api.validate_address.assert_not_called()
+        bot.wallet_api.spendspark.assert_not_called()
+
+        query = SimpleNamespace(
+            id="q", from_user=SimpleNamespace(id=2),
+            message=SimpleNamespace(chat=SimpleNamespace(id=-100), message_id=7),
+        )
+        bot.new_message = SimpleNamespace(callback_query=query)
+        bot.col_envelopes = MemoryCollection([{
+            "_id": "envelope:1", "schemaVersion": 2, "status": "active",
+            "group_id": -100, "msg_id": 7, "creator_id": 1,
+            "amount": 1.0, "remains": 1.0, "takers": [],
+        }])
+        bot.col_users = MemoryCollection([{"_id": 2, "Balance": 0.0}])
+        bot.col_tip_logs = MemoryCollection()
+        bot.run_transaction = transaction_runner(
+            bot.col_users, bot.col_envelopes, bot.col_tip_logs
+        )
+        bot.answer_call_back = Mock()
+
+        bot.catch_envelope("envelope:1")
+        self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 0)
+        self.assertEqual(bot.col_envelopes.documents["envelope:1"]["remains_groth"], 100_000_000)
+        self.assertIn("paused", bot.answer_call_back.call_args.kwargs["text"])
+
+    def test_rpc_parses_money_without_float_rounding(self):
+        api = FiroWalletAPI("http://unused")
+        response = requests.Response()
+        response.status_code = 200
+        response._content = b'{"result":{"amount":99999999.00000038},"error":null}'
+        api.session.post = Mock(return_value=response)
+
+        amount = api._result("gettransaction")["amount"]
+        self.assertEqual(amount, Decimal("99999999.00000038"))
+        self.assertEqual(tipbot.firo_to_groth(amount), 9_999_999_900_000_038)
 
     def test_shared_default_addresses_are_replaced_before_deposits(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
                 {"_id": 1, "Address": ["shared"], "Balance": 0.0},
@@ -1223,7 +1353,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(bot.col_users.documents[2]["Address"], ["address-2"])
 
     def test_envelope_claim_requires_exact_message_and_is_replay_safe(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.user_id = 2
         bot.first_name = "Bob"
         query = SimpleNamespace(
@@ -1277,7 +1407,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(len(bot.col_tip_logs.documents), 1)
 
     def test_ptb22_update_offset_uses_object_attribute(self):
-        bot = tipbot.TipBot.__new__(tipbot.TipBot)
+        bot = ready_bot()
         bot.col_state = MemoryCollection()
 
         bot.acknowledge_updates([Update(update_id=24)])
@@ -1301,6 +1431,18 @@ class SafetyTests(unittest.TestCase):
             bot._loop.call_soon_threadsafe(bot._loop.stop)
             bot._thread.join(timeout=1)
             bot._loop.close()
+
+    def test_tip_sender_named_deposit_is_not_shown_as_a_deposit(self):
+        bot = ready_bot()
+        bot.bot = Mock()
+        bot.image_buffer = Mock(return_value=b"image")
+        drawing = Mock()
+        with patch.object(tipbot.Image, "open"), patch.object(
+            tipbot.ImageDraw, "Draw", return_value=drawing
+        ):
+            bot.create_receive_tips_image(2, "1.00000000", "Deposit")
+
+        self.assertEqual(drawing.text.call_args_list[1].args[1], "sent you a tip of")
 
     def test_html_is_escaped(self):
         self.assertEqual(

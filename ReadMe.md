@@ -16,8 +16,8 @@ Clone firo tip bot repo:
 Install python requirement packages
 <pre>python3 -m pip install -r requirements.txt</pre>
 
-Use Firo Core 0.14.15.1 or newer. Earlier versions can return an incorrect
-Spark address from `getsparkcoinaddr`.
+Use Firo Core 0.14.18.0 or newer. This release is required after the
+September 2026 hard fork and includes the corrected Spark address lookup.
 
 To check if the bot works correct:
 <pre>python3 tipbot.py</pre>
@@ -100,6 +100,12 @@ refuses to migrate an existing database without this explicit confirmation. Do
 not run old and new bot versions against the same database during this
 migration. Reset the setting to `false` after the first successful start.
 
+Legacy deposit records do not identify which user received the old credit.
+Before starting this version, reconcile every legacy deposit against the wallet
+and database backup, then convert each record to a verified output-level deposit
+event or resolve the affected balances manually. The bot refuses to start while
+untracked legacy deposit records remain, including on subsequent restarts.
+
 Run one bot process per database. The bot claims a unique `bot_owner` document
 in the `state` collection before migration or recovery and releases it on a
 clean shutdown after the accounting worker stops. A second process refuses
@@ -116,10 +122,19 @@ and time matches are logged as candidates for manual verification. They do
 not automatically settle a withdrawal. Reconcile these cases against the
 wallet before assigning a transaction ID or refunding funds.
 
+Transfers and envelope claims pause when wallet reconciliation fails, a
+confirmed deposit needs review, or a reorg leaves any account negative. Resolve
+the underlying wallet or accounting issue before transfers resume.
+
+The 0.002 FIRO bot fee is included in the command amount. The Firo network fee
+is deducted from the recipient output, so the amount shown before confirmation
+is a maximum rather than the exact received amount.
+
 The migration also replaces the old shared default deposit address. Users must
-request `/deposit` again before sending funds. A payment later sent to a retired
-shared address is stored as a `deposit-orphan` review record and logged for
-manual ownership checks. It is never assigned to an arbitrary user.
+request `/deposit` again before sending funds. Any wallet-owned deposit output
+without a matching user address is stored as a `deposit-orphan` review record
+and logged for manual ownership checks. It is never assigned to an arbitrary
+user.
 
 Configure init script
 <pre>vim /etc/systemd/system/mongod.service</pre>

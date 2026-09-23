@@ -176,6 +176,9 @@ class SyncBot:
 
 
 class TipBot:
+    # ponytail: one process-wide lock; shard only if reconciliation throughput requires it.
+    accounting_lock = threading.RLock()
+
     def __init__(self, wallet_api):
         # INIT
         self.bot = SyncBot(bot_token)
@@ -197,6 +200,7 @@ class TipBot:
         self.col_envelopes = db['envelopes']
         self.col_txs = db['txs']
         self.col_state = db['state']
+        self.reconciliation_ok = False
         self.stop_jobs = threading.Event()
         self.scheduler_thread = None
         self.claim_process_ownership()
@@ -212,6 +216,11 @@ class TipBot:
             name="unique_deposit_address",
         )
         self.migrate_money_schema()
+        self.col_users.create_index("BalanceGroth", name="negative_balance_guard")
+        self.col_txs.create_index(
+            [("type", 1), ("status", 1), ("review_required", 1)],
+            name="outgoing_hold",
+        )
         self.recover_incomplete_envelopes()
 
         self.message, self.text, self._is_video, self.message_text, \
@@ -300,14 +309,30 @@ class TipBot:
         )
 
     def run_transaction(self, callback):
-        with self.client.start_session() as session:
+        with self.accounting_lock, self.client.start_session() as session:
             return session.with_transaction(callback)
+
+    def outgoing_paused(self, session=None):
+        return (
+            not self.reconciliation_ok
+            or self.col_txs.find_one(
+                {"type": "deposit", "status": "confirmed", "review_required": True},
+                session=session,
+            ) is not None
+            or self.col_users.find_one({"BalanceGroth": {"$lt": 0}}, session=session)
+            is not None
+        )
 
     def command_id(self, prefix):
         update_id = getattr(self.new_message, "update_id", None)
         return "%s:%s" % (prefix, update_id if update_id is not None else uuid.uuid4().hex)
 
     def require_offline_migration_confirmation(self):
+        if self.col_txs.find_one({"type": "deposit", "eventVersion": {"$ne": 2}}):
+            raise RuntimeError(
+                "legacy deposits lack reliable recipient provenance; reconcile "
+                "and convert them offline before starting this bot"
+            )
         state = self.col_state.find_one({"_id": "money_schema"})
         if state and state.get("status") == "complete":
             if state.get("version") != 1:
@@ -331,6 +356,13 @@ class TipBot:
                 "after taking a backup, set mongo.migrationConfirmedOffline to true"
             )
 
+    def create_safe_deposit_addresses(self):
+        addresses = normalize_addresses(self.wallet_api.create_user_wallet())
+        retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
+        if not addresses or (retired and set(addresses).intersection(retired["addresses"])):
+            raise RuntimeError("wallet returned no deposit address or a retired address")
+        return list(dict.fromkeys(addresses))
+
     def migrate_deposit_addresses(self):
         default_addresses = set(
             normalize_addresses(self.wallet_api.get_default_address())
@@ -352,16 +384,8 @@ class TipBot:
                     address for address in addresses
                     if address not in default_addresses
                 ]
-                for address in normalize_addresses(
-                    self.wallet_api.create_user_wallet()
-                ):
-                    if address not in addresses:
-                        addresses.append(address)
                 if not addresses:
-                    raise RuntimeError(
-                        "wallet returned no replacement address for user %s"
-                        % user["_id"]
-                    )
+                    addresses = self.create_safe_deposit_addresses()
                 self.col_users.update_one(
                     {"_id": user["_id"]},
                     {"$set": {"Address": addresses}},
@@ -820,11 +844,13 @@ class TipBot:
 
     def processing_messages(self, new_messages):
         for self.new_message in new_messages:
+            query = getattr(self.new_message, "callback_query", None)
+            message = self.new_message.message or (query.message if query else None)
+            if message is None or self.new_message.effective_user is None:
+                continue
             try:
                 time.sleep(0.5)
-                self.message = self.new_message.message \
-                    if self.new_message.message is not None \
-                    else self.new_message.callback_query.message
+                self.message = message
                 self.text, self._is_video = self.get_action(self.new_message)
                 self.message_text = str(self.text).lower()
                 # init user data
@@ -1102,10 +1128,15 @@ class TipBot:
         print("Current Balance", result)
 
     def update_balance(self):
+        with self.accounting_lock:
+            return self._update_balance()
+
+    def _update_balance(self):
         """
             Update user's balance using transactions history
         """
         print("Handle TXs")
+        self.reconciliation_ok = False
         response = self.wallet_api.get_txs_list()
         if response.get("error"):
             raise RuntimeError(response["error"])
@@ -1131,6 +1162,32 @@ class TipBot:
 
         self.reconcile_deposit_confirmations(by_txid)
         self.reconcile_withdrawals(transactions)
+        self.reconciliation_ok = True
+
+    def flag_deposit_for_review(self, event, reason):
+        reason = str(reason)
+
+        def hold_deposit(session):
+            current = self.col_txs.find_one({"_id": event["_id"]}, session=session)
+            if current is None:
+                return False
+            if current.get("review_required") and current.get("review_reason") == reason:
+                return False
+            self.col_txs.update_one(
+                {"_id": current["_id"]},
+                {"$set": {
+                    "review_required": True,
+                    "review_reason": reason,
+                    "reviewReportedAt": datetime.datetime.utcnow(),
+                }},
+                session=session,
+            )
+            return True
+
+        if self.run_transaction(hold_deposit):
+            self.send_to_logs(
+                "Deposit %s needs review: %s" % (event["txId"], reason)
+            )
 
     def reconcile_deposit_confirmations(self, transactions):
         for event in self.col_txs.find(
@@ -1148,35 +1205,15 @@ class TipBot:
                     if response.get("error"):
                         raise FiroRPCError(response["error"])
                 except (FiroRPCError, FiroTransportError) as exc:
-                    reported = self.col_txs.update_one(
-                        {"_id": event["_id"], "review_reason": {"$ne": str(exc)}},
-                        {"$set": {
-                            "review_required": True,
-                            "review_reason": str(exc),
-                            "reviewReportedAt": datetime.datetime.utcnow(),
-                        }},
-                    )
-                    if reported.modified_count == 1:
-                        self.send_to_logs(
-                            "Deposit %s needs review: %s" % (event["txId"], exc)
-                        )
+                    self.flag_deposit_for_review(event, exc)
                     continue
                 entries = [response["result"]]
                 transactions[event["txId"]] = entries
-            if event.get("review_required"):
-                self.col_txs.update_one(
-                    {"_id": event["_id"]},
-                    {"$unset": {
-                        "review_required": "",
-                        "review_reason": "",
-                        "reviewReportedAt": "",
-                    }},
-                )
             confirmations = max(entry.get("confirmations", 0) for entry in entries)
-            final = (
-                confirmations >= 2
-                and any(entry.get("chainlock") is True for entry in entries)
-            )
+            final = any(is_final_transaction(entry) for entry in entries)
+            if event["status"] == "confirmed" and confirmations >= 2 and not final:
+                self.flag_deposit_for_review(event, "transaction lost chainlock")
+                continue
             amount_groth = event["amount_groth"]
             if event["status"] == "confirmed" and confirmations < 2:
                 expected, new_status, delta_groth = (
@@ -1187,7 +1224,10 @@ class TipBot:
                     "reversed", "confirmed", amount_groth
                 )
             else:
-                continue
+                expected = new_status = event["status"]
+                delta_groth = 0
+                if not event.get("review_required"):
+                    continue
 
             def apply_confirmation_change(
                 session,
@@ -1197,25 +1237,36 @@ class TipBot:
                 new_status=new_status,
                 delta_groth=delta_groth,
             ):
+                current = self.col_txs.find_one(
+                    {"_id": event_id, "status": expected}, session=session
+                )
+                if current is None or (delta_groth == 0 and not current.get("review_required")):
+                    return False
+                update = {"$set": {"status": new_status}}
+                if current.get("review_required"):
+                    update["$unset"] = {
+                        "review_required": "",
+                        "review_reason": "",
+                        "reviewReportedAt": "",
+                    }
                 changed = self.col_txs.update_one(
                     {"_id": event_id, "status": expected},
-                    {"$set": {"status": new_status}},
+                    update,
                     session=session,
                 )
                 if changed.modified_count != 1:
                     return False
-                user = self.col_users.update_one(
-                    {"_id": user_id},
-                    {
-                        "$inc": {
+                if delta_groth:
+                    user = self.col_users.update_one(
+                        {"_id": user_id},
+                        {"$inc": {
                             "BalanceGroth": delta_groth,
                             "Balance": groth_to_float(delta_groth),
-                        }
-                    },
-                    session=session,
-                )
-                if user.modified_count != 1:
-                    raise RuntimeError("reorg deposit recipient disappeared")
+                        }},
+                        session=session,
+                    )
+                    if user.modified_count != 1:
+                        raise RuntimeError("reorg deposit recipient disappeared")
                 return True
 
             self.run_transaction(apply_confirmation_change)
@@ -1253,53 +1304,60 @@ class TipBot:
                 )
             return
 
-        totals = defaultdict(Decimal)
+        totals = defaultdict(int)
         for output in self.wallet_api.get_spark_coin_address(txid):
-            address = output.get("address")
-            if address:
-                totals[address] += Decimal(str(output.get("amount", 0)))
+            try:
+                address = output["address"]
+                amount_groth = firo_to_groth(output["amount"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise FiroTransportError("invalid Spark output for %s" % txid) from exc
+            if not isinstance(address, str) or not address or amount_groth < 0:
+                raise FiroTransportError("invalid Spark output for %s" % txid)
+            if amount_groth == 0:
+                continue
+            totals[address] += amount_groth
+        if not totals:
+            # ponytail: retry empty results; classify non-Spark receives only if repeated RPCs become costly.
+            return
 
         retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
         retired_addresses = set(retired.get("addresses", [])) if retired else set()
         orphaned = False
-        for address, decimal_amount in totals.items():
-            if decimal_amount <= 0:
-                continue
+        for address, amount_groth in totals.items():
             user = self.col_users.find_one({"Address": address})
             if user is None:
-                if address in retired_addresses:
-                    orphaned = True
-                    amount_groth = firo_to_groth(decimal_amount)
-                    try:
-                        self.col_txs.insert_one(
-                            {
-                                "_id": "deposit-orphan:%s:%s" % (txid, address),
-                                "txId": txid,
-                                "address": address,
-                                "amount": groth_to_float(amount_groth),
-                                "amount_groth": amount_groth,
-                                "type": "deposit-orphan",
-                                "eventVersion": 2,
-                                "moneySchemaVersion": 1,
-                                "status": "review_required",
-                                "timestamp": datetime.datetime.utcnow(),
-                            }
-                        )
-                    except DuplicateKeyError:
-                        pass
-                    else:
-                        self.send_to_logs(
-                            "Deposit %s sent %s FIRO to a retired shared address and needs manual ownership review"
-                            % (txid, format_groth(amount_groth))
-                        )
+                orphaned = True
+                try:
+                    self.col_txs.insert_one(
+                        {
+                            "_id": "deposit-orphan:%s:%s" % (txid, address),
+                            "txId": txid,
+                            "address": address,
+                            "amount": groth_to_float(amount_groth),
+                            "amount_groth": amount_groth,
+                            "type": "deposit-orphan",
+                            "eventVersion": 2,
+                            "moneySchemaVersion": 1,
+                            "status": "review_required",
+                            "timestamp": datetime.datetime.utcnow(),
+                        }
+                    )
+                except DuplicateKeyError:
+                    pass
+                else:
+                    address_kind = (
+                        "a retired shared address"
+                        if address in retired_addresses else "an unassigned wallet address"
+                    )
+                    self.send_to_logs(
+                        "Deposit %s sent %s FIRO to %s and needs manual ownership review"
+                        % (txid, format_groth(amount_groth), address_kind)
+                    )
                 continue
 
-            amount_groth = firo_to_groth(decimal_amount)
             amount = groth_to_float(amount_groth)
             event_id = "deposit:%s:%s" % (txid, address)
-            event = dict(transaction)
-            event.update(
-                {
+            event = {
                     "_id": event_id,
                     "txId": txid,
                     "address": address,
@@ -1311,8 +1369,7 @@ class TipBot:
                     "moneySchemaVersion": 1,
                     "status": "confirmed",
                     "timestamp": datetime.datetime.utcnow(),
-                }
-            )
+            }
 
             def credit(
                 session,
@@ -1341,7 +1398,7 @@ class TipBot:
                 continue
 
             self.create_receive_tips_image(
-                user["_id"], "{0:.8f}".format(amount), "Deposit"
+                user["_id"], "{0:.8f}".format(amount), "Deposit", is_deposit=True
             )
             print(
                 "*Deposit Success*\nBalance of address %s increased by %s FIRO."
@@ -1421,7 +1478,10 @@ class TipBot:
             ):
                 continue
             try:
-                amount_groth = abs(firo_to_groth(transaction["amount"]))
+                amount_groth = (
+                    abs(firo_to_groth(transaction["amount"]))
+                    + abs(firo_to_groth(transaction.get("fee", 0)))
+                )
             except (KeyError, ValueError):
                 continue
             if amount_groth != sender["send_amount_groth"]:
@@ -1631,9 +1691,7 @@ class TipBot:
         txid = sender["txId"]
         amount_groth = sender["locked_amount_groth"]
         event_id = "withdraw:%s" % txid
-        event = dict(transaction)
-        event.update(
-            {
+        event = {
                 "_id": event_id,
                 "schemaVersion": 2,
                 "eventVersion": 2,
@@ -1650,8 +1708,7 @@ class TipBot:
                 "locked_amount": sender["locked_amount"],
                 "locked_amount_groth": amount_groth,
                 "timestamp": datetime.datetime.utcnow(),
-            }
-        )
+        }
 
         def complete(session):
             existing = self.col_txs.find_one({"_id": event_id}, session=session)
@@ -1711,10 +1768,11 @@ class TipBot:
         if not completed:
             return
 
-        self.create_send_tips_image(
+        self.send_message(
             sender["user_id"],
-            format_groth(sender["send_amount_groth"]),
-            "%s..." % sender["address"][:8],
+            "Withdrawal %s confirmed. The recipient received up to %s FIRO "
+            "after the network fee was deducted from the output."
+            % (txid, format_groth(sender["send_amount_groth"])),
         )
         print(
             "*Withdrawal Success*\nUser %s withdrew %s FIRO."
@@ -1748,9 +1806,7 @@ class TipBot:
         changed = user.get("Address") != addresses
 
         if valid.get("isvalidSpark") is not True:
-            new_addresses = normalize_addresses(self.wallet_api.create_user_wallet())
-            if not new_addresses:
-                raise RuntimeError("wallet returned no replacement deposit address")
+            new_addresses = self.create_safe_deposit_addresses()
             for address in new_addresses:
                 if address not in addresses:
                     addresses.append(address)
@@ -1764,6 +1820,10 @@ class TipBot:
         return addresses
 
     def withdraw_coins(self, address, amount, comment=""):
+        with self.accounting_lock:
+            return self._withdraw_coins(address, amount, comment)
+
+    def _withdraw_coins(self, address, amount, comment=""):
         """
             Withdraw coins to address with params:
             address
@@ -1775,6 +1835,14 @@ class TipBot:
             self.send_message(
                 self.user_id,
                 dictionary['incorrect_amount'],
+                parse_mode='HTML',
+            )
+            return
+
+        if self.outgoing_paused():
+            self.send_message(
+                self.user_id,
+                "<b>Transfers are paused until wallet reconciliation completes.</b>",
                 parse_mode='HTML',
             )
             return
@@ -1836,6 +1904,8 @@ class TipBot:
         existing = self.col_senders.find_one({"_id": intent_id})
 
         def reserve(session):
+            if self.outgoing_paused(session):
+                return False
             user = self.col_users.update_one(
                 {
                     "_id": self.user_id,
@@ -1880,7 +1950,13 @@ class TipBot:
                 )
                 return
             user = self.col_users.find_one({"_id": self.user_id})
-            if user and user.get("IsWithdraw"):
+            if self.outgoing_paused():
+                self.send_message(
+                    self.user_id,
+                    "<b>Transfers are paused until wallet reconciliation completes.</b>",
+                    parse_mode='HTML',
+                )
+            elif user and user.get("IsWithdraw"):
                 self.send_message(
                     self.user_id,
                     dictionary['withdrawal_busy'],
@@ -1916,7 +1992,7 @@ class TipBot:
                 address,
                 format_groth(send_amount_groth),
                 comment,
-                subtract_fee=False,
+                subtract_fee=True,
             )
             error = response.get("error")
             # Core can persist a spend before reporting a generic wallet error.
@@ -2009,7 +2085,8 @@ class TipBot:
             self.user_id,
             format_groth(send_amount_groth),
             address,
-            msg="Your txId %s. The 0.002 FIRO withdrawal fee is included." % txid,
+            msg=("Your txId %s. The 0.002 FIRO bot fee is included; the "
+                 "network fee is deducted from the displayed recipient amount.") % txid,
         )
 
     @staticmethod
@@ -2134,6 +2211,8 @@ class TipBot:
         tip_type = "atip" if _type == "anonymous" else "tip"
 
         def transfer(session):
+            if self.outgoing_paused(session):
+                return False
             debited = self.col_users.update_one(
                 {
                     "_id": self.user_id,
@@ -2186,10 +2265,10 @@ class TipBot:
 
         if not transferred:
             sender = self.col_users.find_one({"_id": self.user_id})
-            if sender and sender.get("WithdrawalQuarantined") is True:
+            if self.outgoing_paused() or (sender and sender.get("WithdrawalQuarantined") is True):
                 self.send_message(
                     self.user_id,
-                    "<b>Your account is temporarily frozen because an older withdrawal needs manual review.</b>",
+                    "<b>Transfers are paused pending review or wallet reconciliation.</b>",
                     parse_mode="HTML",
                 )
             else:
@@ -2210,7 +2289,7 @@ class TipBot:
             comment,
         )
 
-    def create_receive_tips_image(self, user_id, amount, first_name, comment=""):
+    def create_receive_tips_image(self, user_id, amount, first_name, comment="", is_deposit=False):
         try:
             im = Image.open("images/receive_template.png")
             d = ImageDraw.Draw(im)
@@ -2218,7 +2297,7 @@ class TipBot:
             location_f = (266, 21)
             location_s = (266, 45)
             location_t = (266, 67)
-            if "Deposit" in first_name:
+            if is_deposit:
                 d.text(location_f, "%s" % first_name, font=bold, fill='#000000')
                 d.text(location_s, "has recharged", font=regular, fill='#000000')
                 d.text(location_t, "%s Firo" % "{0:.4f}".format(float(amount)), font=bold, fill='#000000')
@@ -2408,16 +2487,13 @@ class TipBot:
             traceback.print_exc()
 
     def red_envelope_created(self, first_name, envelope_id):
-        im = Image.open("images/red_envelope_created.png")
-
-        d = ImageDraw.Draw(im)
-        location_who = (230, 35)
-        location_note = (256, 70)
-
-        d.text(location_who, "%s CREATED" % first_name, font=bold, fill='#000000')
-        d.text(location_note, "A RED ENVELOPE", font=bold,
-               fill='#f72c56')
         try:
+            im = Image.open("images/red_envelope_created.png")
+            d = ImageDraw.Draw(im)
+            location_who = (230, 35)
+            location_note = (256, 70)
+            d.text(location_who, "%s CREATED" % first_name, font=bold, fill='#000000')
+            d.text(location_note, "A RED ENVELOPE", font=bold, fill='#f72c56')
             response = self.bot.send_photo(
                 self.group_id,
                 self.image_buffer(im),
@@ -2503,6 +2579,8 @@ class TipBot:
         def reserve(session):
             if self.col_envelopes.find_one({"_id": envelope_id}, session=session):
                 return True
+            if self.outgoing_paused(session):
+                return False
             debited = self.col_users.update_one(
                 {
                     "_id": self.user_id,
@@ -2542,10 +2620,10 @@ class TipBot:
 
         if not reserved:
             sender = self.col_users.find_one({"_id": self.user_id})
-            if sender and sender.get("WithdrawalQuarantined") is True:
+            if self.outgoing_paused() or (sender and sender.get("WithdrawalQuarantined") is True):
                 self.send_message(
                     self.user_id,
-                    "<b>Your account is temporarily frozen because an older withdrawal needs manual review.</b>",
+                    "<b>Transfers are paused pending review or wallet reconciliation.</b>",
                     parse_mode="HTML",
                 )
             else:
@@ -2625,6 +2703,8 @@ class TipBot:
         result = {}
 
         def claim(session):
+            if self.outgoing_paused(session):
+                return False
             current = self.col_envelopes.find_one(
                 {
                     "_id": envelope_id,
@@ -2634,6 +2714,11 @@ class TipBot:
                 session=session,
             )
             if current is None or current["remains_groth"] <= 0:
+                return False
+            if self.col_users.find_one(
+                {"_id": current["creator_id"], "WithdrawalQuarantined": True},
+                session=session,
+            ):
                 return False
 
             remaining_groth = current["remains_groth"]
@@ -2726,7 +2811,9 @@ class TipBot:
 
         if not claimed:
             self.answer_call_back(
-                text="You already claimed this envelope, or it has ended.",
+                text=("Claims are paused pending deposit review."
+                      if self.outgoing_paused()
+                      else "You already claimed this envelope, or it has ended."),
                 query_id=query.id,
             )
             return
@@ -2828,7 +2915,7 @@ class TipBot:
         try:
             user = self.col_users.find_one({"_id": self.user_id})
             if user is None:
-                public_address = self.wallet_api.create_user_wallet()
+                public_address = self.create_safe_deposit_addresses()
                 profile = {
                     "first_name": self.first_name,
                     "IsVerified": True,
@@ -2846,7 +2933,7 @@ class TipBot:
                         "$set": profile,
                         "$setOnInsert": {
                             "JoinDate": datetime.datetime.utcnow(),
-                            "Address": normalize_addresses(public_address),
+                            "Address": public_address,
                             "Balance": 0.0,
                             "Locked": 0.0,
                             "BalanceGroth": 0,
