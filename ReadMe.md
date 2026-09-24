@@ -92,10 +92,11 @@ Use a connection string containing `?replicaSet=rs0`, as shown in
 standalone writes cannot safely move funds between accounts.
 
 Before the first start of this version, stop every old tipbot process and back
-up both MongoDB and the Firo wallet. Reconcile wallet sends and deposits as
-described below, then set `mongo.migrationConfirmedOffline` to `true` in
-`services.json` and start one updated process. It converts balances to integer
-groth, refunds the unclaimed remainder of legacy red envelopes, and quarantines
+up both MongoDB and the Firo wallet. Reconcile wallet sends, deposits, and
+off-chain transfers as described below, then set
+`mongo.migrationConfirmedOffline` to `true` in `services.json` and start one
+updated process. It converts balances to integer groth, refunds the unclaimed
+remainder of legacy red envelopes, and quarantines
 legacy withdrawals that cannot be reconstructed safely. Do not run old and new
 bot versions against the same database. Reset the setting to `false` after the
 first successful start.
@@ -141,6 +142,28 @@ locked balance without a matching withdrawal is preserved and quarantined for
 review; it is included in the wallet coverage check.
 The bot refuses to start while noncanonical legacy deposit records remain,
 including on subsequent restarts.
+
+The old bot updated tip senders, recipients, and `tip_logs` in separate writes.
+It also recorded a red-envelope taker and reduced the remainder before
+crediting that taker. A crash or overwritten balance update can leave a user
+underpaid even when total wallet assets cover recorded balances. Review old
+tips and envelope claims against database backups and available logs, and
+correct any balance discrepancy while the bot is stopped. If migration has
+already started, correct both `BalanceGroth` (the authoritative integer amount)
+and its `Balance` mirror for each affected user. For each legacy envelope with
+takers or an unexplained decrease in its remainder, verify the claims before
+setting `legacyClaimsReviewed: true` and a nonempty `legacyClaimsReviewNote` on
+that envelope. The bot refuses to migrate an envelope with unreviewed claims;
+it automatically refunds the unclaimed remainder after review. If the
+historical balance effect cannot be established, keep the bot stopped rather
+than assume that aggregate wallet coverage proves each user's balance.
+
+```
+db.envelopes.updateOne({_id: "<envelope id>"}, {$set: {
+  legacyClaimsReviewed: true,
+  legacyClaimsReviewNote: "<claimants, amounts, evidence, and corrections>"
+}})
+```
 
 Run one bot process per database. The bot claims a unique `bot_owner` document
 in the `state` collection before migration or recovery and releases it on a
@@ -191,13 +214,13 @@ The 0.002 FIRO bot fee is included in the command amount. The Firo network fee
 is deducted from the recipient output, so the amount shown before confirmation
 is a maximum rather than the exact received amount.
 
-The migration also replaces the old shared default deposit address. The bot
-sends each affected user their replacement address directly and retries failed
-delivery while running; they can also request it with `/deposit` before sending
-funds. Any wallet-owned
-deposit output without a matching user address, apart from the dedicated admin
-funding address, is stored as a `deposit-orphan` review record and logged for
-manual ownership checks. It is never assigned to an arbitrary user.
+The migration also replaces the old shared default deposit address. After
+startup, the bot sends replacement addresses in batches of five per minute
+and retries failed deliveries; users can also request theirs with `/deposit`.
+Any wallet-owned deposit output without a matching user address, apart from
+the dedicated admin funding address or an internal automint to the wallet's
+retired default address, is stored as a `deposit-orphan` review record and
+logged for manual ownership checks. It is never assigned to an arbitrary user.
 
 Configure init script
 <pre>vim /etc/systemd/system/mongod.service</pre>

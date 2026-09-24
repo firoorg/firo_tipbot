@@ -375,6 +375,100 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(bot.col_txs.documents["deposit-scan:orphan"]["orphaned"])
         bot.send_to_logs.assert_called_once()
 
+    def test_own_mint_to_retired_default_does_not_orphan_or_hide_user_output(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([{
+            "_id": 1, "Address": ["user-spark"], "Balance": 0,
+        }])
+        bot.col_state = MemoryCollection([{
+            "_id": "retired_deposit_addresses", "addresses": ["default-spark"],
+        }])
+        bot.wallet_api = SimpleNamespace(
+            get_txs_list=lambda: {"result": [
+                {"txid": "mint-tx", "category": "mint", "confirmations": 2,
+                 "chainlock": True},
+                {"txid": "mint-tx", "category": "receive", "confirmations": 2,
+                 "chainlock": True},
+            ], "error": None},
+            list_spark_spends=lambda: [],
+            get_spark_coin_address=lambda txid: [
+                {"address": "default-spark", "amount": 1},
+                {"address": "user-spark", "amount": 0.5},
+            ],
+        )
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
+        bot.create_receive_tips_image = Mock()
+        bot.send_to_logs = Mock()
+        bot.verify_solvency = Mock()
+        bot.reconcile_withdrawals = Mock()
+
+        bot.update_balance()
+        bot.update_balance()
+
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 50_000_000)
+        self.assertNotIn("deposit-orphan:mint-tx:default-spark", bot.col_txs.documents)
+        self.assertFalse(bot.col_txs.documents["deposit-scan:mint-tx"]["orphaned"])
+        self.assertFalse(bot.outgoing_paused())
+
+    def test_existing_internal_mint_orphan_is_cleared_but_other_orphans_remain(self):
+        bot = ready_bot()
+        bot.col_state = MemoryCollection([{
+            "_id": "retired_deposit_addresses", "addresses": ["default-spark"],
+        }])
+        bot.col_txs = MemoryCollection([
+            {"_id": "deposit-orphan:mint-tx:default-spark", "txId": "mint-tx",
+             "address": "default-spark", "type": "deposit-orphan",
+             "status": "review_required", "amount_groth": 100_000_000},
+            {"_id": "deposit-orphan:mint-tx:other-spark", "txId": "mint-tx",
+             "address": "other-spark", "type": "deposit-orphan",
+             "status": "review_required", "amount_groth": 50_000_000},
+            {"_id": "deposit-scan:mint-tx", "txId": "mint-tx",
+             "type": "deposit-scan", "status": "review_required", "orphaned": True},
+        ])
+
+        bot.reconcile_internal_mint_orphans([{"txid": "mint-tx", "category": "mint"}])
+
+        self.assertEqual(
+            bot.col_txs.documents["deposit-orphan:mint-tx:default-spark"]["status"],
+            "internal_mint",
+        )
+        self.assertEqual(
+            bot.col_txs.documents["deposit-orphan:mint-tx:other-spark"]["status"],
+            "review_required",
+        )
+        self.assertTrue(bot.col_txs.documents["deposit-scan:mint-tx"]["orphaned"])
+        self.assertTrue(bot.outgoing_paused())
+
+        bot.col_txs.documents.pop("deposit-orphan:mint-tx:other-spark")
+        bot.reconcile_internal_mint_orphans([{"txid": "mint-tx", "category": "mint"}])
+        self.assertFalse(bot.col_txs.documents["deposit-scan:mint-tx"]["orphaned"])
+        self.assertFalse(bot.outgoing_paused())
+
+    def test_unconfirmed_automint_shortfall_requests_recheck_before_topup(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 1, "Locked": 0}])
+        bot.col_state = MemoryCollection([{
+            "_id": "admin_funding_address", "address": "admin-spark",
+        }])
+        bot.wallet_api = SimpleNamespace(
+            get_spark_balance=lambda: {"availableBalance": 0},
+            list_confirmed_unspent=lambda: [],
+            get_txs_list=lambda: {"result": [{
+                "txid": "mint-tx", "category": "mint", "confirmations": 0,
+                "abandoned": False,
+            }], "error": None},
+            list_spark_addresses=lambda: {"admin-spark"},
+        )
+        bot.send_to_logs = Mock(return_value=True)
+
+        with self.assertRaises(tipbot.FundingShortfall) as raised:
+            bot.verify_solvency()
+
+        message = str(raised.exception)
+        self.assertIn("A wallet mint is unconfirmed", message)
+        self.assertIn("Recheck before topping up", message)
+        self.assertNotIn("Send at least", message)
+
     def test_unassigned_wallet_output_is_recorded_for_review(self):
         bot = ready_bot()
         bot.wallet_api = SimpleNamespace(
@@ -1368,7 +1462,7 @@ class SafetyTests(unittest.TestCase):
         bot.normalize_legacy_deposits()
         self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 100_000_000)
 
-    def test_legacy_envelope_refund_reads_remainder_inside_transaction(self):
+    def test_legacy_envelope_refund_rechecks_claims_inside_transaction(self):
         bot = ready_bot()
         bot.col_users = MemoryCollection([{"_id": 1, "Balance": 0.0}])
         bot.col_envelopes = MemoryCollection(
@@ -1391,12 +1485,80 @@ class SafetyTests(unittest.TestCase):
             return callback(None)
 
         bot.run_transaction = run
+        with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+            bot.refund_legacy_envelopes()
+
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
+        envelope = bot.col_envelopes.documents["legacy-envelope"]
+        self.assertEqual(envelope["remains"], 0.4)
+        self.assertNotIn("schemaVersion", envelope)
+
+    def test_legacy_envelope_without_claims_refunds_automatically(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 0.0}])
+        bot.col_envelopes = MemoryCollection([{
+            "_id": "unclaimed", "creator_id": 1, "amount": 1.0,
+            "remains": 1.0, "takers": [],
+        }])
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_envelopes)
+        bot.send_to_logs = Mock()
+
+        bot.refund_legacy_envelopes()
         bot.refund_legacy_envelopes()
 
-        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 40_000_000)
-        envelope = bot.col_envelopes.documents["legacy-envelope"]
-        self.assertEqual(envelope["legacy_refunded_groth"], 40_000_000)
-        self.assertEqual(envelope["status"], "legacy_refunded")
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 100_000_000)
+        self.assertEqual(
+            bot.col_envelopes.documents["unclaimed"]["status"], "legacy_refunded"
+        )
+
+    def test_legacy_envelope_claims_require_review_before_and_after_refund(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([
+            {"_id": 1, "Balance": 0.0},
+            {"_id": 2, "Balance": 0.0},
+        ])
+        bot.col_envelopes = MemoryCollection([{
+            "_id": "claimed", "creator_id": 1, "amount": 1.0,
+            "remains": 0.4, "takers": [[2, 0.6]],
+        }])
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_envelopes)
+        bot.send_to_logs = Mock()
+
+        with patch.dict(tipbot.conf["mongo"], {"migrationConfirmedOffline": True}):
+            with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+                bot.require_offline_migration_confirmation()
+            with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+                bot.refund_legacy_envelopes()
+            with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+                bot.migrate_money_schema()
+            self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
+            self.assertNotIn("schemaVersion", bot.col_envelopes.documents["claimed"])
+            self.assertNotIn("money_schema", bot.col_state.documents)
+
+            envelope = bot.col_envelopes.documents["claimed"]
+            envelope["legacyClaimsReviewed"] = True
+            envelope["legacyClaimsReviewNote"] = " "
+            with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+                bot.require_offline_migration_confirmation()
+
+            # Offline review found that the old claim had not credited user 2.
+            bot.col_users.documents[2]["BalanceGroth"] = 60_000_000
+            bot.col_users.documents[2]["Balance"] = 0.6
+            envelope["legacyClaimsReviewNote"] = "Claimant 2 credited 0.6 FIRO offline"
+            bot.require_offline_migration_confirmation()
+            bot.migrate_money_schema()
+            bot.migrate_money_schema()
+            bot.refund_legacy_envelopes()
+
+            self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 40_000_000)
+            self.assertEqual(bot.col_users.documents[2]["BalanceGroth"], 60_000_000)
+            self.assertEqual(envelope["status"], "legacy_refunded")
+            self.assertEqual(envelope["legacy_refunded_groth"], 40_000_000)
+            self.assertEqual(bot.col_state.documents["money_schema"]["status"], "complete")
+
+            del envelope["legacyClaimsReviewNote"]
+            with self.assertRaisesRegex(RuntimeError, "unverified claims"):
+                bot.require_offline_migration_confirmation()
 
     def test_unresolved_legacy_withdrawal_quarantines_zero_lock_user(self):
         bot = ready_bot()

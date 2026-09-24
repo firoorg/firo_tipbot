@@ -22,6 +22,7 @@ fonts/                     # ProximaNova TrueType fonts for image generation
 - **Scheduled tasks**: `schedule` library runs in a background thread:
   - `update_balance()` every 60 seconds — monitors blockchain for deposits
   - `automintunspent()` every 300 seconds — anonymizes transparent funds
+  - `send_address_migration_notices()` every 60 seconds — sends up to five queued address notices
 - **Image generation**: PIL/Pillow creates template-based confirmation images sent to users
 - **Spark protocol**: Uses Firo's Spark privacy protocol (migrated from Lelantus)
 

@@ -23,6 +23,7 @@ import traceback
 import uuid
 from collections import defaultdict
 from decimal import Decimal, InvalidOperation
+from itertools import islice
 
 import pyqrcode
 import schedule
@@ -150,6 +151,26 @@ def normalize_addresses(value):
     raise ValueError("invalid address schema")
 
 
+def legacy_envelope_needs_claim_review(envelope):
+    if envelope.get("schemaVersion") == 2:
+        if envelope.get("status") != "legacy_refunded":
+            return False
+        amount = envelope.get("amount_groth")
+        if amount is None:
+            amount = legacy_firo_to_groth(envelope.get("amount", 0))
+        unclaimed = envelope.get("legacy_refunded_groth", 0)
+    else:
+        amount = legacy_firo_to_groth(envelope.get("amount", 0))
+        unclaimed = legacy_firo_to_groth(envelope.get("remains", 0))
+    if not envelope.get("takers") and amount == unclaimed:
+        return False
+    return (
+        envelope.get("legacyClaimsReviewed") is not True
+        or not isinstance(envelope.get("legacyClaimsReviewNote"), str)
+        or not envelope["legacyClaimsReviewNote"].strip()
+    )
+
+
 class FundingShortfall(RuntimeError):
     pass
 
@@ -218,9 +239,9 @@ class TipBot:
             # Legacy failed RPCs stored explicit null IDs, which sparse indexes include.
             self.col_senders.update_many({"txId": None}, {"$unset": {"txId": ""}})
             self.col_senders.create_index("txId", unique=True, sparse=True)
+            startup_history = self.wallet_api.get_txs_list()
             self.verify_wallet_spends(
-                self.wallet_api.list_spark_spends(),
-                self.wallet_api.get_txs_list(),
+                self.wallet_api.list_spark_spends(), startup_history
             )
             self.migrate_deposit_addresses()
             self.col_users.create_index(
@@ -230,6 +251,8 @@ class TipBot:
                 name="unique_deposit_address",
             )
             self.migrate_money_schema()
+            # Clear false orphan liabilities before the first funding check.
+            self.reconcile_internal_mint_orphans(startup_history["result"])
             try:
                 self.verify_solvency()
             except FundingShortfall:
@@ -268,7 +291,7 @@ class TipBot:
         schedule.every(300).seconds.do(
             self.safe_job, "automint", self.wallet_api.automintunspent
         )
-        schedule.every(300).seconds.do(
+        schedule.every(60).seconds.do(
             self.safe_job, "address migration notice", self.send_address_migration_notices
         )
         self.scheduler_thread = threading.Thread(target=self.pending_tasks, daemon=True)
@@ -492,12 +515,19 @@ class TipBot:
         if history.get("error") or not isinstance(history.get("result"), list):
             raise RuntimeError("wallet history is incomplete during solvency check")
         pending_txids = set()
+        inflight_mint = False
         for entry in history["result"]:
             if not isinstance(entry, dict):
                 raise RuntimeError("wallet history contains an invalid transaction")
             confirmations = entry.get("confirmations", 0)
             if type(confirmations) is not int:
                 raise RuntimeError("wallet history contains invalid confirmations")
+            if (
+                entry.get("category") == "mint"
+                and confirmations == 0
+                and entry.get("abandoned") is not True
+            ):
+                inflight_mint = True
             if (
                 entry.get("category") == "receive"
                 and confirmations >= 1
@@ -552,6 +582,11 @@ class TipBot:
                     "sending additional funds."
                     % format_groth(pending_groth)
                 )
+            if inflight_mint:
+                message += (
+                    " A wallet mint is unconfirmed; the displayed shortfall "
+                    "may shrink when it finalizes. Recheck before topping up."
+                )
             if uncertain_locks:
                 message += (
                     " %s FIRO of locked withdrawal claims is unresolved; "
@@ -559,7 +594,7 @@ class TipBot:
                     % format_groth(uncertain_locks)
                 )
             if address:
-                if pending_groth or uncertain_locks:
+                if pending_groth or inflight_mint or uncertain_locks:
                     message += (
                         " Once pending funds and claims are resolved, send any "
                         "remaining shortfall net from an external wallet to the "
@@ -582,6 +617,7 @@ class TipBot:
                 or previous_alert.get("shortfall_groth") != shortfall
                 or previous_alert.get("address") != address
                 or previous_alert.get("pending_groth") != pending_groth
+                or previous_alert.get("inflight_mint") != inflight_mint
                 or previous_alert.get("uncertain_locks_groth") != uncertain_locks
             ):
                 logger.error(message)
@@ -592,6 +628,7 @@ class TipBot:
                             "shortfall_groth": shortfall,
                             "address": address,
                             "pending_groth": pending_groth,
+                            "inflight_mint": inflight_mint,
                             "uncertain_locks_groth": uncertain_locks,
                         }},
                         upsert=True,
@@ -613,6 +650,11 @@ class TipBot:
         complete = state and state.get("status") == "complete"
         legacy_deposits = []
         missing_credit_review = []
+        unreviewed_envelopes = [
+            str(envelope["_id"])
+            for envelope in self.col_envelopes.find({})
+            if legacy_envelope_needs_claim_review(envelope)
+        ]
         for event in self.col_txs.find({"type": "deposit"}):
             txid = event.get("txId")
             address = event.get("address")
@@ -645,6 +687,13 @@ class TipBot:
                 "%s legacy deposits need verified prior-credit decisions and "
                 "review notes (IDs: %s)"
                 % (len(missing_credit_review), ", ".join(missing_credit_review[:10]))
+            )
+        if unreviewed_envelopes:
+            issues.append(
+                "%s legacy envelopes have unverified claims; reconcile each "
+                "claimant balance offline and set legacyClaimsReviewed: true "
+                "with a nonempty legacyClaimsReviewNote (IDs: %s)"
+                % (len(unreviewed_envelopes), ", ".join(unreviewed_envelopes[:10]))
             )
         if complete:
             if state.get("version") != 1:
@@ -743,6 +792,7 @@ class TipBot:
             {"$set": {"addresses": sorted(retired_addresses)}},
             upsert=True,
         )
+        replaced_count = 0
         for user in self.col_users.find({}):
             addresses = list(dict.fromkeys(normalize_addresses(user.get("Address"))))
             if default_addresses.intersection(addresses):
@@ -759,10 +809,7 @@ class TipBot:
                         "AddressMigrationNoticePending": True,
                     }},
                 )
-                self.send_to_logs(
-                    "Replaced shared default deposit address for user %s"
-                    % user["_id"]
-                )
+                replaced_count += 1
             elif addresses != user.get("Address"):
                 self.col_users.update_one(
                     {"_id": user["_id"]},
@@ -779,10 +826,30 @@ class TipBot:
                         "deposit address %s belongs to multiple users" % address
                     )
                 owners[address] = user["_id"]
-        self.send_address_migration_notices()
+        if replaced_count:
+            self.send_to_logs(
+                "Replaced shared default deposit addresses for %s users; notices queued"
+                % replaced_count
+            )
 
     def send_address_migration_notices(self):
-        for user in self.col_users.find({"AddressMigrationNoticePending": True}):
+        now = datetime.datetime.utcnow()
+        users = list(islice(self.col_users.find({
+            "AddressMigrationNoticePending": True,
+            "AddressMigrationNoticeAttemptAt": {"$exists": False},
+        }), 5))
+        if len(users) < 5:
+            users.extend(islice(self.col_users.find({
+                "AddressMigrationNoticePending": True,
+                "AddressMigrationNoticeAttemptAt": {
+                    "$lt": now - datetime.timedelta(minutes=5),
+                },
+            }), 5 - len(users)))
+        for user in users:
+            self.col_users.update_one(
+                {"_id": user["_id"], "AddressMigrationNoticePending": True},
+                {"$set": {"AddressMigrationNoticeAttemptAt": now}},
+            )
             addresses = normalize_addresses(user.get("Address"))
             if not addresses:
                 raise RuntimeError("user %s has no replacement deposit address" % user["_id"])
@@ -793,7 +860,10 @@ class TipBot:
             ) is not None:
                 self.col_users.update_one(
                     {"_id": user["_id"]},
-                    {"$unset": {"AddressMigrationNoticePending": ""}},
+                    {"$unset": {
+                        "AddressMigrationNoticePending": "",
+                        "AddressMigrationNoticeAttemptAt": "",
+                    }},
                 )
 
     def migrate_money_schema(self):
@@ -1038,6 +1108,10 @@ class TipBot:
                 if not 0 <= remains_groth <= amount_groth:
                     raise RuntimeError(
                         "legacy envelope %s has an invalid remainder" % envelope_id
+                    )
+                if legacy_envelope_needs_claim_review(current):
+                    raise RuntimeError(
+                        "legacy envelope %s has unverified claims" % envelope_id
                     )
                 if remains_groth:
                     credited = self.col_users.update_one(
@@ -1580,6 +1654,7 @@ class TipBot:
             if txid:
                 by_txid.setdefault(txid, []).append(transaction)
 
+        self.reconcile_internal_mint_orphans(transactions)
         for txid, entries in by_txid.items():
             receive = next(
                 (
@@ -1590,12 +1665,50 @@ class TipBot:
                 None,
             )
             if receive is not None:
-                self.apply_deposits(receive)
+                self.apply_deposits(
+                    receive,
+                    own_mint=any(entry.get("category") == "mint" for entry in entries),
+                )
 
         self.reconcile_deposit_confirmations(by_txid)
         self.reconcile_withdrawals(transactions)
         self.verify_solvency()
         self.reconciliation_ok = True
+
+    def reconcile_internal_mint_orphans(self, transactions):
+        minted_txids = {
+            entry.get("txid") for entry in transactions
+            if isinstance(entry, dict) and entry.get("category") == "mint"
+            and isinstance(entry.get("txid"), str) and entry["txid"]
+        }
+        retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
+        retired_addresses = set(retired.get("addresses", [])) if retired else set()
+        affected_txids = set()
+        for orphan in self.col_txs.find({
+            "type": "deposit-orphan",
+            "status": {"$in": ["review_required", "internal_mint"]},
+        }):
+            if (orphan.get("txId") not in minted_txids
+                    or orphan.get("address") not in retired_addresses):
+                continue
+            affected_txids.add(orphan["txId"])
+            if orphan["status"] == "review_required":
+                self.col_txs.update_one(
+                    {"_id": orphan["_id"], "status": "review_required"},
+                    {"$set": {"status": "internal_mint"}},
+                )
+        for txid in affected_txids:
+            unresolved = self.col_txs.find_one({
+                "txId": txid, "type": "deposit-orphan",
+                "status": "review_required",
+            }) is not None
+            self.col_txs.update_one(
+                {"_id": "deposit-scan:%s" % txid},
+                {"$set": {
+                    "orphaned": unresolved,
+                    "status": "review_required" if unresolved else "complete",
+                }},
+            )
 
     def flag_deposit_for_review(self, event, reason):
         reason = str(reason)
@@ -1704,7 +1817,7 @@ class TipBot:
 
             self.run_transaction(apply_confirmation_change)
 
-    def apply_deposits(self, transaction):
+    def apply_deposits(self, transaction, own_mint=False):
         txid = transaction["txid"]
         scan_id = "deposit-scan:%s" % txid
         if self.col_txs.find_one({"_id": scan_id}):
@@ -1760,6 +1873,8 @@ class TipBot:
         orphaned = False
         admin_funding_groth = 0
         for address, amount_groth in totals.items():
+            if own_mint and address in retired_addresses:
+                continue  # automintspark mints the bot's transparent funds here.
             user = self.col_users.find_one({"Address": address})
             if address == admin_address:
                 if user is not None:
