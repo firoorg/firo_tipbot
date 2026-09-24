@@ -182,6 +182,7 @@ class ProcessOwnershipTests(unittest.TestCase):
         client.get_default_database.return_value = database
         with patch.object(tipbot, "SyncBot"), patch.object(tipbot, "MongoClient", return_value=client), \
                 patch.object(tipbot.TipBot, "claim_process_ownership"), \
+                patch.object(tipbot.TipBot, "ensure_admin_funding_address"), \
                 patch.object(tipbot.TipBot, "require_offline_migration_confirmation"), \
                 self.assertRaisesRegex(RuntimeError, "index checked"):
             tipbot.TipBot(Mock())

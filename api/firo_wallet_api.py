@@ -61,6 +61,15 @@ class FiroWalletAPI:
     def get_default_address(self):
         return self._result("getsparkdefaultaddress")
 
+    def list_spark_addresses(self):
+        addresses = self._result("getallsparkaddresses")
+        if (
+            not isinstance(addresses, dict)
+            or not all(isinstance(address, str) and address for address in addresses.values())
+        ):
+            raise FiroTransportError("getallsparkaddresses returned invalid wallet addresses")
+        return set(addresses.values())
+
     def get_spark_coin_address(self, tx_hash):
         return self._result("getsparkcoinaddr", [tx_hash])
 
@@ -103,7 +112,7 @@ class FiroWalletAPI:
         return self._result("getsparkbalance")
 
     def list_confirmed_unspent(self):
-        return self._result("listunspent", [1, 9999999, [], False])
+        return self._result("listunspent", [2, 9999999, [], False])
 
     def get_wallet_status(self):
         return self._rpc("getinfo", request_id=6)

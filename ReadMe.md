@@ -136,7 +136,9 @@ Add a nonempty `legacyReviewNote` explaining the evidence. Do not also apply
 the event's expected credit or reversal manually: the migration applies
 the difference between `legacyCreditPresent` and `status` exactly once in a
 MongoDB transaction. A reversed deposit whose old credit was spent may leave a
-negative account, which pauses outgoing transfers until resolved.
+negative account, which pauses outgoing transfers until resolved. A legacy
+locked balance without a matching withdrawal is preserved and quarantined for
+review; it is included in the wallet coverage check.
 The bot refuses to start while noncanonical legacy deposit records remain,
 including on subsequent restarts.
 
@@ -159,21 +161,43 @@ wallet before assigning a transaction ID or refunding funds.
 Transfers and envelope claims pause when wallet reconciliation fails, a
 confirmed deposit needs review, a reorg leaves any account negative, or
 confirmed spendable wallet assets cannot cover positive user balances, envelope
-remainders, and unbroadcast withdrawal locks. Resolve the underlying wallet or
-accounting issue before transfers resume. This aggregate check cannot prove
-which user owns a legacy wallet send or deposit; review each historical event.
-It can also pause transfers temporarily while automint or withdrawal change is
-waiting for confirmation.
+remainders, unresolved withdrawal locks, and unassigned deposits. When assets
+fall short, the bot reports the FIRO coverage gap and funding instructions to
+the configured admin log (`log_ch` in `services.json`; configure an
+administrator-only chat). Startup errors also appear in the service log. On
+its first startup it creates a dedicated Spark funding address and saves it
+in `state` for reuse; deposits to this address fund the bot's
+reserve and are never credited to a user. Back up the wallet again after this
+address is generated so a restore retains it; startup checks that the saved
+address belongs to the active wallet. If Telegram delivery fails, read the
+saved address with `db.state.findOne({_id: "admin_funding_address"}).address`
+in `mongosh` only after confirming it appears in the active wallet's
+`getallsparkaddresses` result. Send at least the reported shortfall
+*net received* to that address from an external wallet, allowing for the
+sending wallet's network fee. Pending Spark receipts are excluded until final;
+unresolved withdrawal claims are counted conservatively, so review those before
+deciding the final top-up. The bot stays online with transfers paused during
+a funding-only shortfall and checks wallet assets
+periodically. It logs the top-up receipt after two confirmations and chainlock;
+the solvency check excludes nonfinal Spark receipts even if the wallet reports
+them as available. Do not top up through a user's `/deposit` address, since
+that also increases the amount owed
+to that user. A top-up does not establish ownership or resolve a legacy wallet
+send or deposit review; reconcile each historical event as described above.
+The aggregate check can also pause transfers temporarily while automint or
+withdrawal change is waiting for confirmation.
 
 The 0.002 FIRO bot fee is included in the command amount. The Firo network fee
 is deducted from the recipient output, so the amount shown before confirmation
 is a maximum rather than the exact received amount.
 
-The migration also replaces the old shared default deposit address. Users must
-request `/deposit` again before sending funds. Any wallet-owned deposit output
-without a matching user address is stored as a `deposit-orphan` review record
-and logged for manual ownership checks. It is never assigned to an arbitrary
-user.
+The migration also replaces the old shared default deposit address. The bot
+sends each affected user their replacement address directly and retries failed
+delivery while running; they can also request it with `/deposit` before sending
+funds. Any wallet-owned
+deposit output without a matching user address, apart from the dedicated admin
+funding address, is stored as a `deposit-orphan` review record and logged for
+manual ownership checks. It is never assigned to an arbitrary user.
 
 Configure init script
 <pre>vim /etc/systemd/system/mongod.service</pre>
@@ -239,7 +263,7 @@ While still in root user on your VPS (or alternatively you can sudo within your 
 
 ## How to install Firo Wallet/Node on Ubuntu
 
-#### Download and unpack Firo Core 0.14.15.1 or newer
+#### Download and unpack Firo Core 0.14.18.0 or newer
 
 Use the current Linux release from https://github.com/firoorg/firo/releases.
 

@@ -1136,7 +1136,7 @@ class SafetyTests(unittest.TestCase):
 
     def test_underfunded_wallet_blocks_reconciliation_without_spend(self):
         bot = ready_bot()
-        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 1.0}])
+        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 1.0, "Locked": 0.0}])
         bot.wallet_api = SimpleNamespace(
             get_txs_list=lambda: {"result": [], "error": None},
             list_spark_spends=lambda: [],
@@ -1150,9 +1150,10 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(bot.reconciliation_ok)
         self.assertTrue(bot.outgoing_paused())
 
+        bot.migrate_money_schema()
+        self.assertEqual(bot.col_state.documents["money_schema"]["status"], "complete")
         with self.assertRaisesRegex(RuntimeError, "assets do not cover"):
-            bot.migrate_money_schema()
-        self.assertNotIn("money_schema", bot.col_state.documents)
+            bot.verify_solvency()
 
     def test_wallet_spend_preflight_requires_review_for_spark_only_spend(self):
         bot = ready_bot()
@@ -1198,7 +1199,7 @@ class SafetyTests(unittest.TestCase):
                 })
                 bot.verify_wallet_spends(spend, history)
 
-    def test_legacy_lock_dust_is_removed_without_active_withdrawals(self):
+    def test_unmatched_legacy_lock_is_preserved_and_quarantined(self):
         bot = ready_bot()
         bot.col_users = MemoryCollection(
             [
@@ -1206,7 +1207,7 @@ class SafetyTests(unittest.TestCase):
                     "_id": 1,
                     "Address": ["deposit"],
                     "Balance": 9.0,
-                    "Locked": 0.0001,
+                    "Locked": 1.0,
                     "IsWithdraw": False,
                 }
             ]
@@ -1231,8 +1232,12 @@ class SafetyTests(unittest.TestCase):
         bot.migrate_money_schema()
 
         user = bot.col_users.documents[1]
-        self.assertEqual((user["LockedGroth"], user["Locked"]), (0, 0.0))
-        self.assertFalse(user["IsWithdraw"])
+        self.assertEqual((user["LockedGroth"], user["Locked"]), (100_000_000, 1.0))
+        self.assertTrue(user["IsWithdraw"])
+        self.assertTrue(user["WithdrawalQuarantined"])
+        self.assertEqual(
+            bot.col_state.documents["money_schema"]["quarantined_withdrawals"], 1
+        )
 
     def test_existing_database_requires_offline_migration_confirmation(self):
         bot = ready_bot()
@@ -1569,6 +1574,45 @@ class SafetyTests(unittest.TestCase):
 
         self.assertEqual(bot.col_users.documents[1]["Address"], ["address-1"])
         self.assertEqual(bot.col_users.documents[2]["Address"], ["address-2"])
+
+    def test_shared_address_notice_retries_without_changing_replacement(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([{
+            "_id": 1, "Address": ["shared"], "Balance": 0.0,
+        }])
+        bot.wallet_api = SimpleNamespace(
+            get_default_address=Mock(return_value=["shared"]),
+            create_user_wallet=Mock(return_value="replacement"),
+        )
+        bot.send_to_logs = Mock()
+        bot.send_message = Mock(return_value=None)
+
+        bot.migrate_deposit_addresses()
+        self.assertEqual(bot.col_users.documents[1]["Address"], ["replacement"])
+        self.assertTrue(bot.col_users.documents[1]["AddressMigrationNoticePending"])
+
+        bot.send_message.return_value = object()
+        bot.send_address_migration_notices()
+        self.assertEqual(bot.col_users.documents[1]["Address"], ["replacement"])
+        self.assertNotIn("AddressMigrationNoticePending", bot.col_users.documents[1])
+        bot.wallet_api.create_user_wallet.assert_called_once_with()
+
+    def test_shared_address_replacement_cannot_belong_to_another_user(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([
+            {"_id": 1, "Address": ["taken"]},
+            {"_id": 2, "Address": ["shared"]},
+        ])
+        bot.wallet_api = SimpleNamespace(
+            get_default_address=Mock(return_value=["shared"]),
+            create_user_wallet=Mock(return_value="taken"),
+        )
+        bot.send_message = Mock()
+
+        with self.assertRaisesRegex(RuntimeError, "reserved address"):
+            bot.migrate_deposit_addresses()
+
+        bot.send_message.assert_not_called()
 
     def test_envelope_claim_requires_exact_message_and_is_replay_safe(self):
         bot = ready_bot()

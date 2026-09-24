@@ -150,6 +150,10 @@ def normalize_addresses(value):
     raise ValueError("invalid address schema")
 
 
+class FundingShortfall(RuntimeError):
+    pass
+
+
 class SyncBot:
     def __init__(self, token):
         self._bot = Bot(token)
@@ -207,29 +211,43 @@ class TipBot:
         self.stop_jobs = threading.Event()
         self.scheduler_thread = None
         self.claim_process_ownership()
-        self.require_offline_migration_confirmation()
-        # Legacy failed RPCs stored explicit null IDs, which sparse indexes include.
-        self.col_senders.update_many({"txId": None}, {"$unset": {"txId": ""}})
-        self.col_senders.create_index("txId", unique=True, sparse=True)
-        self.verify_wallet_spends(
-            self.wallet_api.list_spark_spends(),
-            self.wallet_api.get_txs_list(),
-        )
-        self.migrate_deposit_addresses()
-        self.col_users.create_index(
-            "Address",
-            unique=True,
-            sparse=True,
-            name="unique_deposit_address",
-        )
-        self.migrate_money_schema()
-        self.verify_solvency()
-        self.col_users.create_index("BalanceGroth", name="negative_balance_guard")
-        self.col_txs.create_index(
-            [("type", 1), ("status", 1), ("review_required", 1)],
-            name="outgoing_hold",
-        )
-        self.recover_incomplete_envelopes()
+        solvency_checked = False
+        try:
+            self.admin_funding_address = self.ensure_admin_funding_address()
+            self.require_offline_migration_confirmation()
+            # Legacy failed RPCs stored explicit null IDs, which sparse indexes include.
+            self.col_senders.update_many({"txId": None}, {"$unset": {"txId": ""}})
+            self.col_senders.create_index("txId", unique=True, sparse=True)
+            self.verify_wallet_spends(
+                self.wallet_api.list_spark_spends(),
+                self.wallet_api.get_txs_list(),
+            )
+            self.migrate_deposit_addresses()
+            self.col_users.create_index(
+                "Address",
+                unique=True,
+                sparse=True,
+                name="unique_deposit_address",
+            )
+            self.migrate_money_schema()
+            try:
+                self.verify_solvency()
+            except FundingShortfall:
+                pass  # Keep polling so a confirmed top-up can resume transfers.
+            solvency_checked = True
+            self.col_users.create_index("BalanceGroth", name="negative_balance_guard")
+            self.col_txs.create_index(
+                [("type", 1), ("status", 1), ("review_required", 1)],
+                name="outgoing_hold",
+            )
+            self.recover_incomplete_envelopes()
+        except Exception as exc:
+            if not isinstance(exc, FundingShortfall):
+                detail = "Tipbot startup blocked: %s" % exc
+                if not solvency_checked:
+                    detail += "; funding gap is unavailable until this is resolved"
+                self.send_to_logs(detail)
+            raise
 
         self.message, self.text, self._is_video, self.message_text, \
             self.first_name, self.username, self.user_id, self.firo_address, \
@@ -249,6 +267,9 @@ class TipBot:
         )
         schedule.every(300).seconds.do(
             self.safe_job, "automint", self.wallet_api.automintunspent
+        )
+        schedule.every(300).seconds.do(
+            self.safe_job, "address migration notice", self.send_address_migration_notices
         )
         self.scheduler_thread = threading.Thread(target=self.pending_tasks, daemon=True)
         self.scheduler_thread.start()
@@ -298,8 +319,11 @@ class TipBot:
         try:
             return job()
         except Exception as exc:
-            logger.exception("%s failed", name)
-            self.send_to_logs("%s failed: %s" % (name, exc))
+            if isinstance(exc, FundingShortfall):
+                logger.warning("%s: %s", name, exc)
+            else:
+                logger.exception("%s failed", name)
+                self.send_to_logs("%s failed: %s" % (name, exc))
             return None
 
     def acknowledge_updates(self, updates):
@@ -325,6 +349,10 @@ class TipBot:
             not self.reconciliation_ok
             or self.col_txs.find_one(
                 {"type": "deposit", "status": "confirmed", "review_required": True},
+                session=session,
+            ) is not None
+            or self.col_txs.find_one(
+                {"type": "deposit-orphan", "status": "review_required"},
                 session=session,
             ) is not None
             or self.col_users.find_one({"BalanceGroth": {"$lt": 0}}, session=session)
@@ -385,6 +413,8 @@ class TipBot:
 
     def verify_solvency(self):
         liabilities = 0
+        active_locks = defaultdict(int)
+        uncertain_locks = 0
         for user in self.col_users.find({}):
             balance = user["BalanceGroth"]
             groth_to_decimal(balance)
@@ -395,33 +425,184 @@ class TipBot:
             if remains < 0:
                 raise RuntimeError("envelope has a negative remainder")
             liabilities += remains
-        # These withdrawals have not left the wallet and can be refunded.
+        # Keep unmatched legacy locks in the liability until reviewed.
         for sender in self.col_senders.find({
-            "schemaVersion": 2, "status": {"$in": ["reserved", "rejected"]}
+            "schemaVersion": 2,
+            "status": {"$in": [
+                "reserved", "broadcasting", "unknown", "pending",
+                "reorged", "conflicted", "rejected",
+            ]},
         }):
             locked = sender["locked_amount_groth"]
             groth_to_decimal(locked)
             if locked < 0:
                 raise RuntimeError("withdrawal has a negative lock")
-            liabilities += locked
+            active_locks[sender["user_id"]] += locked
+            uncertain = sender["status"] in (
+                "broadcasting", "unknown", "reorged", "conflicted"
+            ) or (
+                sender["status"] == "pending"
+                and (not sender.get("txId") or sender.get("review_required") is True)
+            )
+            if sender["status"] in ("reserved", "rejected") or uncertain:
+                liabilities += locked
+                if uncertain:
+                    uncertain_locks += locked
+        for user in self.col_users.find({}):
+            locked = user["LockedGroth"]
+            groth_to_decimal(locked)
+            unmatched = max(locked - active_locks[user["_id"]], 0)
+            liabilities += unmatched
+            uncertain_locks += unmatched
+        for orphan in self.col_txs.find({
+            "type": "deposit-orphan", "status": "review_required"
+        }):
+            amount = orphan["amount_groth"]
+            groth_to_decimal(amount)
+            if amount < 0:
+                raise RuntimeError("orphan deposit has a negative amount")
+            liabilities += amount
 
         spark = self.wallet_api.get_spark_balance()
         available = spark.get("availableBalance") if isinstance(spark, dict) else None
         if type(available) is not int or available < 0:
             raise RuntimeError("wallet returned an invalid Spark balance")
-        assets = available
+        transparent_assets = 0
         unspent = self.wallet_api.list_confirmed_unspent()
         if not isinstance(unspent, list):
             raise RuntimeError("wallet returned invalid transparent outputs")
+        transparent_finality = {}
         for output in unspent:
             if not isinstance(output, dict):
                 raise RuntimeError("wallet returned an invalid transparent output")
             if output.get("spendable") is True:
-                assets += firo_to_groth(output["amount"])
-        if liabilities > assets:
-            raise RuntimeError(
-                "wallet assets do not cover spendable account and envelope balances"
+                txid = output.get("txid")
+                if not isinstance(txid, str) or not txid:
+                    raise RuntimeError("wallet returned a transparent output without a transaction id")
+                if txid not in transparent_finality:
+                    status = self.wallet_api.get_tx_status(txid)
+                    if status.get("error"):
+                        raise RuntimeError("transparent output finality could not be verified")
+                    transparent_finality[txid] = is_final_transaction(status["result"])
+                if transparent_finality[txid]:
+                    transparent_assets += firo_to_groth(output["amount"])
+        # Firo reports one-confirmation Spark mints as available. Exclude all
+        # wallet-owned receives until the same finality used for deposit credit.
+        history = self.wallet_api.get_txs_list()
+        if history.get("error") or not isinstance(history.get("result"), list):
+            raise RuntimeError("wallet history is incomplete during solvency check")
+        pending_txids = set()
+        for entry in history["result"]:
+            if not isinstance(entry, dict):
+                raise RuntimeError("wallet history contains an invalid transaction")
+            confirmations = entry.get("confirmations", 0)
+            if type(confirmations) is not int:
+                raise RuntimeError("wallet history contains invalid confirmations")
+            if (
+                entry.get("category") == "receive"
+                and confirmations >= 1
+                and not is_final_transaction(entry)
+            ):
+                txid = entry.get("txid")
+                if not isinstance(txid, str) or not txid:
+                    raise RuntimeError("wallet history contains a receive without a transaction id")
+                pending_txids.add(txid)
+        pending_groth = 0
+        if pending_txids:
+            for txid in pending_txids:
+                outputs = self.wallet_api.get_spark_coin_address(txid)
+                if not isinstance(outputs, list):
+                    raise FiroTransportError("invalid Spark outputs for %s" % txid)
+                for output in outputs:
+                    if not isinstance(output, dict):
+                        raise FiroTransportError("invalid Spark output for %s" % txid)
+                    address = output.get("address")
+                    if not isinstance(address, str) or not address:
+                        raise FiroTransportError("invalid Spark output for %s" % txid)
+                    amount = firo_to_groth(output.get("amount"))
+                    if amount < 0:
+                        raise FiroTransportError("invalid Spark output for %s" % txid)
+                    pending_groth += amount
+        assets = max(available - pending_groth, 0) + transparent_assets
+        shortfall = max(liabilities - assets, 0)
+        previous_alert = self.col_state.find_one({"_id": "funding_shortfall_alert"})
+        if shortfall:
+            funding = self.col_state.find_one({"_id": "admin_funding_address"})
+            address = funding.get("address") if funding else None
+            if address:
+                try:
+                    if address not in self.wallet_api.list_spark_addresses():
+                        address = None
+                except (FiroRPCError, FiroTransportError):
+                    logger.exception("admin funding address ownership could not be checked")
+                    address = None
+            message = (
+                "Wallet assets do not cover recorded liabilities. "
+                "Owed: %s FIRO; finality-adjusted wallet assets: %s FIRO; "
+                "shortfall: %s FIRO."
+                % (
+                    format_groth(liabilities), format_groth(assets),
+                    format_groth(shortfall),
+                )
             )
+            if pending_groth:
+                message += (
+                    " %s FIRO of wallet-owned Spark receipts is pending two "
+                    "confirmations and chainlock; recheck after finality before "
+                    "sending additional funds."
+                    % format_groth(pending_groth)
+                )
+            if uncertain_locks:
+                message += (
+                    " %s FIRO of locked withdrawal claims is unresolved; "
+                    "review those claims before deciding the final top-up."
+                    % format_groth(uncertain_locks)
+                )
+            if address:
+                if pending_groth or uncertain_locks:
+                    message += (
+                        " Once pending funds and claims are resolved, send any "
+                        "remaining shortfall net from an external wallet to the "
+                        "admin-only Spark address %s." % address
+                    )
+                else:
+                    message += (
+                        " Send at least %s FIRO net from an external wallet to "
+                        "the admin-only Spark address %s."
+                        % (format_groth(shortfall), address)
+                    )
+                message += (
+                    " Wait for two confirmations and a chainlock before "
+                    "treating the top-up as final."
+                )
+            else:
+                message += " Admin funding address unavailable; do not send funds."
+            if (
+                not previous_alert
+                or previous_alert.get("shortfall_groth") != shortfall
+                or previous_alert.get("address") != address
+                or previous_alert.get("pending_groth") != pending_groth
+                or previous_alert.get("uncertain_locks_groth") != uncertain_locks
+            ):
+                logger.error(message)
+                if self.send_to_logs(message):
+                    self.col_state.update_one(
+                        {"_id": "funding_shortfall_alert"},
+                        {"$set": {
+                            "shortfall_groth": shortfall,
+                            "address": address,
+                            "pending_groth": pending_groth,
+                            "uncertain_locks_groth": uncertain_locks,
+                        }},
+                        upsert=True,
+                    )
+            raise FundingShortfall(message)
+        if previous_alert and previous_alert.get("shortfall_groth"):
+            if self.send_to_logs("Wallet funding coverage restored; outgoing transfers can resume after reconciliation."):
+                self.col_state.update_one(
+                    {"_id": "funding_shortfall_alert"},
+                    {"$set": {"shortfall_groth": 0}},
+                )
 
     def command_id(self, prefix):
         update_id = getattr(self.new_message, "update_id", None)
@@ -430,6 +611,8 @@ class TipBot:
     def require_offline_migration_confirmation(self):
         state = self.col_state.find_one({"_id": "money_schema"})
         complete = state and state.get("status") == "complete"
+        legacy_deposits = []
+        missing_credit_review = []
         for event in self.col_txs.find({"type": "deposit"}):
             txid = event.get("txId")
             address = event.get("address")
@@ -443,47 +626,108 @@ class TipBot:
                 or not 0 < event["amount_groth"] <= MAX_GROTH
                 or event.get("status") not in ("confirmed", "reversed")
             ):
-                raise RuntimeError(
-                    "legacy deposits lack canonical output-level records; "
-                    "reconcile and convert them offline before starting this bot"
-                )
-            if not complete and (
+                legacy_deposits.append(str(event["_id"]))
+            elif not complete and (
                 type(event.get("legacyCreditPresent")) is not bool
                 or not isinstance(event.get("legacyReviewNote"), str)
                 or not event["legacyReviewNote"].strip()
             ):
-                raise RuntimeError(
-                    "legacy deposit %s needs a verified prior-credit decision "
-                    "and review note" % event["_id"]
-                )
+                missing_credit_review.append(str(event["_id"]))
+        issues = []
+        if legacy_deposits:
+            issues.append(
+                "%s legacy deposits lack canonical output-level records; "
+                "reconcile and convert them offline (IDs: %s)"
+                % (len(legacy_deposits), ", ".join(legacy_deposits[:10]))
+            )
+        if missing_credit_review:
+            issues.append(
+                "%s legacy deposits need verified prior-credit decisions and "
+                "review notes (IDs: %s)"
+                % (len(missing_credit_review), ", ".join(missing_credit_review[:10]))
+            )
         if complete:
             if state.get("version") != 1:
                 raise RuntimeError("unsupported completed money schema version")
-            return
-        has_existing_data = any(
-            collection.find_one({}) is not None
-            for collection in (
-                self.col_users,
-                self.col_senders,
-                self.col_envelopes,
-                self.col_txs,
+        else:
+            has_existing_data = any(
+                collection.find_one({}) is not None
+                for collection in (
+                    self.col_users,
+                    self.col_senders,
+                    self.col_envelopes,
+                    self.col_txs,
+                )
             )
-        )
-        if (
-            has_existing_data
-            and conf["mongo"].get("migrationConfirmedOffline") is not True
-        ):
-            raise RuntimeError(
-                "legacy data migration requires every old tipbot process to be stopped; "
-                "after taking a backup, set mongo.migrationConfirmedOffline to true"
-            )
+            if (
+                has_existing_data
+                and conf["mongo"].get("migrationConfirmedOffline") is not True
+            ):
+                issues.append(
+                    "legacy data migration requires every old tipbot process to "
+                    "be stopped; after taking a backup, set "
+                    "mongo.migrationConfirmedOffline to true"
+                )
+        if issues:
+            raise RuntimeError("; ".join(issues))
 
     def create_safe_deposit_addresses(self):
         addresses = normalize_addresses(self.wallet_api.create_user_wallet())
         retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
-        if not addresses or (retired and set(addresses).intersection(retired["addresses"])):
-            raise RuntimeError("wallet returned no deposit address or a retired address")
+        funding = self.col_state.find_one({"_id": "admin_funding_address"})
+        if (
+            not addresses
+            or (retired and set(addresses).intersection(retired["addresses"]))
+            or (funding and funding.get("address") in addresses)
+            or any(self.col_users.find_one({"Address": address}) for address in addresses)
+        ):
+            raise RuntimeError("wallet returned no deposit address or a reserved address")
         return list(dict.fromkeys(addresses))
+
+    def ensure_admin_funding_address(self):
+        record = self.col_state.find_one({"_id": "admin_funding_address"})
+        default_addresses = set(normalize_addresses(self.wallet_api.get_default_address()))
+        owned_addresses = self.wallet_api.list_spark_addresses()
+        for user in self.col_users.find({}):
+            if not set(normalize_addresses(user.get("Address"))).issubset(owned_addresses):
+                raise RuntimeError(
+                    "existing user deposit address is not owned by the active wallet; "
+                    "restore the original wallet before sending funds"
+                )
+        retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
+        retired_addresses = set(retired.get("addresses", [])) if retired else set()
+        if record:
+            address = record.get("address")
+        else:
+            addresses = normalize_addresses(self.wallet_api.create_user_wallet())
+            if len(addresses) != 1:
+                raise RuntimeError("wallet did not create one admin-only Spark address")
+            address = addresses[0]
+        if (
+            not isinstance(address, str) or not address
+            or address in default_addresses or address in retired_addresses
+            or self.col_users.find_one({"Address": address}) is not None
+        ):
+            raise RuntimeError("admin funding address is not exclusive to the administrator")
+        if address not in self.wallet_api.list_spark_addresses():
+            raise RuntimeError(
+                "admin funding address is not owned by the active wallet; "
+                "restore the original wallet before sending funds"
+            )
+        if not record:
+            self.col_state.insert_one({
+                "_id": "admin_funding_address",
+                "address": address,
+                "created_at": datetime.datetime.utcnow(),
+            })
+        if not record or not record.get("announced_at"):
+            logger.error("Admin-only Spark funding address: %s", address)
+            if self.send_to_logs("Admin-only Spark funding address: %s" % address):
+                self.col_state.update_one(
+                    {"_id": "admin_funding_address"},
+                    {"$set": {"announced_at": datetime.datetime.utcnow()}},
+                )
+        return address
 
     def migrate_deposit_addresses(self):
         default_addresses = set(
@@ -510,16 +754,14 @@ class TipBot:
                     addresses = self.create_safe_deposit_addresses()
                 self.col_users.update_one(
                     {"_id": user["_id"]},
-                    {"$set": {"Address": addresses}},
+                    {"$set": {
+                        "Address": addresses,
+                        "AddressMigrationNoticePending": True,
+                    }},
                 )
                 self.send_to_logs(
                     "Replaced shared default deposit address for user %s"
                     % user["_id"]
-                )
-                self.send_message(
-                    user["_id"],
-                    "<b>Your old shared deposit address was retired. Use /deposit to get your current address before sending funds.</b>",
-                    parse_mode="HTML",
                 )
             elif addresses != user.get("Address"):
                 self.col_users.update_one(
@@ -537,6 +779,22 @@ class TipBot:
                         "deposit address %s belongs to multiple users" % address
                     )
                 owners[address] = user["_id"]
+        self.send_address_migration_notices()
+
+    def send_address_migration_notices(self):
+        for user in self.col_users.find({"AddressMigrationNoticePending": True}):
+            addresses = normalize_addresses(user.get("Address"))
+            if not addresses:
+                raise RuntimeError("user %s has no replacement deposit address" % user["_id"])
+            if self.send_message(
+                user["_id"],
+                "<b>Your old shared deposit address was retired. Your new address is:</b> <pre>%s</pre>" % html.escape(addresses[-1]),
+                parse_mode="HTML",
+            ) is not None:
+                self.col_users.update_one(
+                    {"_id": user["_id"]},
+                    {"$unset": {"AddressMigrationNoticePending": ""}},
+                )
 
     def migrate_money_schema(self):
         state = self.col_state.find_one({"_id": "money_schema"})
@@ -680,6 +938,14 @@ class TipBot:
                 raise RuntimeError(
                     "user %s lock does not cover active withdrawals" % user_id
                 )
+            unmatched_lock = user["LockedGroth"] - locked_groth
+            if unmatched_lock and user_id not in quarantined_users:
+                self.send_to_logs(
+                    "User %s has %s FIRO of legacy locked funds without a "
+                    "matching withdrawal; review before releasing the lock"
+                    % (user_id, format_groth(unmatched_lock))
+                )
+                quarantined_users.add(user_id)
             if user_id in quarantined_users:
                 self.col_users.update_one(
                     {"_id": user_id},
@@ -703,7 +969,6 @@ class TipBot:
                 },
             )
 
-        self.verify_solvency()
         self.col_state.update_one(
             {"_id": "money_schema"},
             {
@@ -1060,8 +1325,10 @@ class TipBot:
                 LOG_CHANNEL,
                 text
             )
+            return True
         except Exception as exc:
             print(exc)
+            return False
 
     def get_group_username(self):
         """
@@ -1488,9 +1755,17 @@ class TipBot:
 
         retired = self.col_state.find_one({"_id": "retired_deposit_addresses"})
         retired_addresses = set(retired.get("addresses", [])) if retired else set()
+        funding = self.col_state.find_one({"_id": "admin_funding_address"})
+        admin_address = funding.get("address") if funding else None
         orphaned = False
+        admin_funding_groth = 0
         for address, amount_groth in totals.items():
             user = self.col_users.find_one({"Address": address})
+            if address == admin_address:
+                if user is not None:
+                    raise RuntimeError("admin funding address is assigned to a user")
+                admin_funding_groth += amount_groth
+                continue
             if user is None:
                 orphaned = True
                 try:
@@ -1581,11 +1856,17 @@ class TipBot:
                     "eventVersion": 2,
                     "status": "review_required" if orphaned else "complete",
                     "orphaned": orphaned,
+                    "admin_funding_groth": admin_funding_groth,
                     "timestamp": datetime.datetime.utcnow(),
                 }
             },
             upsert=True,
         )
+        if admin_funding_groth:
+            self.send_to_logs(
+                "Admin funding of %s FIRO confirmed in transaction %s"
+                % (format_groth(admin_funding_groth), txid)
+            )
 
     def report_withdrawal_once(self, sender, reason):
         reported = self.col_senders.update_one(

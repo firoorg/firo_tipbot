@@ -11,7 +11,7 @@ class AccountingTests(unittest.TestCase):
     @staticmethod
     def deposit_bot():
         bot = ready_bot()
-        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 10.0}])
+        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 10.0, "Locked": 0.0}])
         bot.col_txs = MemoryCollection(
             [
                 {
