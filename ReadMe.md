@@ -19,56 +19,7 @@ Install python requirement packages
 Use Firo Core 0.14.18.0 or newer. This release is required after the
 September 2026 hard fork and includes the corrected Spark address lookup.
 
-To check if the bot works correct:
-<pre>python3 tipbot.py</pre>
-If there's not exceptions, use Ctrl+C to break the process.
-
-Configure TipBot init script
-<pre>vim /etc/systemd/system/tipbot.service</pre>
-
-Paste
-<pre>
-[Unit]
-Description=firotipbot
-After=network.target
-After=mongodb.service
-
-
-[Service]
-Type=simple
-WorkingDirectory=/root/firo_tipbot
-ExecStart=/usr/bin/python3 tipbot.py
-EnvironmentFile=/etc/environment
-RestartSec=10
-SyslogIdentifier=tipbot
-TimeoutStopSec=120
-TimeoutStartSec=2
-StartLimitInterval=120
-StartLimitBurst=5
-KillMode=mixed
-Restart=always
-PrivateTmp=true
-
-
-[Install]
-WantedBy=multi-user.target
-</pre>
-
-<pre>systemctl daemon-reload</pre>
-
-Run the following systemctl command to start the MongoDB service:
-<pre>sudo systemctl start tipbot.service</pre>
- 
-Then check the service’s status.
-<pre>sudo systemctl status tipbot.service</pre>
-
-After confirming that the service is running as expected, enable the MongoDB service to start up at boot:
-<pre>sudo systemctl enable tipbot.service</pre>
-
-To stop the service
-<pre>sudo systemctl stop tipbot.service</pre>
-
-### Install Mongodb on ubuntu
+### Install MongoDB on Ubuntu
 
 Install MongoDB 6.0 or newer from the
 [official MongoDB installation guide](https://www.mongodb.com/docs/manual/administration/install-on-linux/).
@@ -86,10 +37,59 @@ Restart MongoDB and initialize the set once:
 
 <pre>sudo systemctl restart mongod</pre>
 <pre>mongosh --eval "rs.initiate()"</pre>
+<pre>sudo systemctl enable mongod</pre>
 
 Use a connection string containing `?replicaSet=rs0`, as shown in
 `services.json`. The bot refuses to start against standalone MongoDB because
 standalone writes cannot safely move funds between accounts.
+
+Configure TipBot init script
+<pre>vim /etc/systemd/system/tipbot.service</pre>
+
+Paste the following, setting `WorkingDirectory` to the absolute path where you
+cloned the repository:
+<pre>
+[Unit]
+Description=firotipbot
+After=network.target
+After=mongod.service
+Requires=mongod.service
+
+
+[Service]
+Type=simple
+WorkingDirectory=/root/firo_tipbot
+ExecStart=/usr/bin/python3 tipbot.py
+EnvironmentFile=/etc/environment
+RestartSec=10
+SyslogIdentifier=tipbot
+TimeoutStopSec=infinity
+TimeoutStartSec=2
+StartLimitInterval=120
+StartLimitBurst=5
+KillMode=mixed
+Restart=always
+PrivateTmp=true
+
+
+[Install]
+WantedBy=multi-user.target
+</pre>
+
+<pre>sudo systemctl daemon-reload</pre>
+
+After completing the migration and backup steps below, start the tipbot service:
+<pre>sudo systemctl start tipbot.service</pre>
+ 
+Then check the service’s status.
+<pre>sudo systemctl status tipbot.service</pre>
+
+After confirming that the service is running as expected, enable the tipbot
+service to start at boot:
+<pre>sudo systemctl enable tipbot.service</pre>
+
+To stop the service
+<pre>sudo systemctl stop tipbot.service</pre>
 
 Before the first start of this version, stop every old tipbot process and back
 up both MongoDB and the Firo wallet. Reconcile wallet sends, deposits, and
@@ -221,48 +221,6 @@ Any wallet-owned deposit output without a matching user address, apart from
 the dedicated admin funding address or an internal automint to the wallet's
 retired default address, is stored as a `deposit-orphan` review record and
 logged for manual ownership checks. It is never assigned to an arbitrary user.
-
-Configure init script
-<pre>vim /etc/systemd/system/mongod.service</pre>
-<pre>
-[Unit]
-Description=High-performance, schema-free document-oriented database
-After=network.target
-Documentation=https://docs.mongodb.org/manual
-
-[Service]
-User=mongodb
-Group=mongodb
-ExecStart=/usr/bin/mongod --quiet --config /etc/mongod.conf
-RestartSec=10
-TimeoutStopSec=120
-TimeoutStartSec=2
-StartLimitInterval=120
-StartLimitBurst=5
-TasksMax=infinity
-TasksAccounting=false
-KillMode=mixed
-Restart=always
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-</pre>
-
-
-<pre>systemctl daemon-reload</pre>
-
-Run the following systemctl command to start the MongoDB service:
-<pre>sudo systemctl start mongod.service</pre>
- 
-Then check the service’s status.
-<pre>sudo systemctl status mongod.service</pre>
-
-After confirming that the service is running as expected, enable the MongoDB service to start up at boot:
-<pre>sudo systemctl enable mongod.service</pre>
-
-To stop the service
-<pre>sudo systemctl stop mongod.service</pre>
 
 ## Install Firewall
 #### To install Firewall follow instructoins

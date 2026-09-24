@@ -208,9 +208,10 @@ class AdminFundingTests(unittest.TestCase):
                 "confirmations": 1, "chainlock": False,
             }], "error": None}),
             list_spark_addresses=Mock(return_value={"user-spark"}),
-            get_spark_coin_address=Mock(return_value=[{
-                "address": "user-spark", "amount": 0.8,
-            }]),
+            listsparkmints=Mock(return_value={"result": [{
+                "txid": "pending-user", "isUsed": False,
+                "nHeight": 1, "amount": 0.8,
+            }], "error": None}),
         )
 
         with self.assertRaisesRegex(RuntimeError, "0.80000000 FIRO"):
@@ -277,6 +278,30 @@ class AdminFundingTests(unittest.TestCase):
             "ownership review" in str(call) for call in bot.send_to_logs.call_args_list
         ))
 
+    def test_failed_admin_topup_notice_is_retried_from_scan_record(self):
+        bot = ready_bot()
+        bot.col_state = MemoryCollection([{
+            "_id": "admin_funding_address", "address": "admin-spark",
+        }])
+        bot.wallet_api = SimpleNamespace(
+            get_spark_coin_address=Mock(return_value=[
+                {"address": "admin-spark", "amount": 1.5},
+            ]),
+        )
+        bot.send_to_logs = Mock(side_effect=[False, True])
+        transaction = {"txid": "fund-tx"}
+
+        bot.apply_deposits(transaction)
+        scan = bot.col_txs.documents["deposit-scan:fund-tx"]
+        self.assertNotIn("admin_funding_announced_at", scan)
+
+        bot.apply_deposits(transaction)
+        self.assertIn("admin_funding_announced_at", scan)
+        bot.apply_deposits(transaction)
+
+        self.assertEqual(bot.send_to_logs.call_count, 2)
+        bot.wallet_api.get_spark_coin_address.assert_called_once_with("fund-tx")
+
     def test_confirmed_admin_topup_resumes_reconciliation(self):
         bot = ready_bot()
         bot.col_users = MemoryCollection([{
@@ -293,6 +318,10 @@ class AdminFundingTests(unittest.TestCase):
             get_spark_coin_address=Mock(return_value=[
                 {"address": "admin-spark", "amount": 0.8},
             ]),
+            listsparkmints=Mock(return_value={"result": [{
+                "txid": "fund-tx", "isUsed": False,
+                "nHeight": 1, "amount": 0.8,
+            }], "error": None}),
             list_spark_addresses=Mock(return_value={"admin-spark"}),
         )
         bot.send_to_logs = Mock(return_value=True)

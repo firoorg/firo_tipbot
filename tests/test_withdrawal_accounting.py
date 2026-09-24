@@ -198,7 +198,7 @@ class ProcessOwnershipTests(unittest.TestCase):
 
         bot.scheduler_thread.is_alive.return_value = False
         bot.release_process_ownership()
-        bot.scheduler_thread.join.assert_called_with(timeout=5)
+        bot.scheduler_thread.join.assert_called_with()
         bot.col_state.delete_one.assert_called_once_with({
             "_id": "bot_owner", "owner_id": "owner-token",
         })

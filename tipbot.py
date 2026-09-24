@@ -31,6 +31,7 @@ from PIL import Image, ImageDraw, ImageFont
 from pymongo import MongoClient
 from pymongo.errors import DuplicateKeyError
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ChatID
 
 from api.firo_wallet_api import FiroRPCError, FiroTransportError, FiroWalletAPI
 
@@ -47,6 +48,9 @@ MIN_ENVELOPE = Decimal("0.001")
 WITHDRAW_FEE_GROTH = 200_000
 MIN_ENVELOPE_GROTH = 100_000
 MAX_TIP_COMMENT_UTF16 = 1000  # Photo captions allow 1024 units including "Comment: ".
+NON_HUMAN_USER_IDS = frozenset((
+    ChatID.ANONYMOUS_ADMIN, ChatID.FAKE_CHANNEL, ChatID.SERVICE_CHAT,
+))
 
 with open('services.json') as conf_file:
     conf = json.load(conf_file)
@@ -330,7 +334,7 @@ class TipBot:
     def release_process_ownership(self):
         self.stop_jobs.set()
         if self.scheduler_thread is not None:
-            self.scheduler_thread.join(timeout=5)
+            self.scheduler_thread.join()
             if self.scheduler_thread.is_alive():
                 return  # Leave ownership in place while accounting work can still run.
         try:
@@ -509,13 +513,14 @@ class TipBot:
                     transparent_finality[txid] = is_final_transaction(status["result"])
                 if transparent_finality[txid]:
                     transparent_assets += firo_to_groth(output["amount"])
-        # Firo reports one-confirmation Spark mints as available. Exclude all
-        # wallet-owned receives until the same finality used for deposit credit.
+        # Firo counts one-confirmation Spark coins as available, including
+        # spend change. Exclude nonfinal wallet outputs until bot finality.
         history = self.wallet_api.get_txs_list()
         if history.get("error") or not isinstance(history.get("result"), list):
             raise RuntimeError("wallet history is incomplete during solvency check")
         pending_txids = set()
         inflight_mint = False
+        inflight_spend = False
         for entry in history["result"]:
             if not isinstance(entry, dict):
                 raise RuntimeError("wallet history contains an invalid transaction")
@@ -529,29 +534,41 @@ class TipBot:
             ):
                 inflight_mint = True
             if (
-                entry.get("category") == "receive"
+                entry.get("category") == "spend"
+                and confirmations == 0
+                and entry.get("abandoned") is not True
+            ):
+                inflight_spend = True
+            if (
+                entry.get("category") in ("receive", "spend")
                 and confirmations >= 1
                 and not is_final_transaction(entry)
             ):
                 txid = entry.get("txid")
                 if not isinstance(txid, str) or not txid:
-                    raise RuntimeError("wallet history contains a receive without a transaction id")
+                    raise RuntimeError("wallet history contains a nonfinal output without a transaction id")
                 pending_txids.add(txid)
         pending_groth = 0
         if pending_txids:
-            for txid in pending_txids:
-                outputs = self.wallet_api.get_spark_coin_address(txid)
-                if not isinstance(outputs, list):
-                    raise FiroTransportError("invalid Spark outputs for %s" % txid)
-                for output in outputs:
-                    if not isinstance(output, dict):
-                        raise FiroTransportError("invalid Spark output for %s" % txid)
-                    address = output.get("address")
-                    if not isinstance(address, str) or not address:
-                        raise FiroTransportError("invalid Spark output for %s" % txid)
-                    amount = firo_to_groth(output.get("amount"))
+            mints = self.wallet_api.listsparkmints()
+            if not isinstance(mints, dict):
+                raise FiroTransportError("invalid Spark mint response")
+            if mints.get("error"):
+                raise FiroRPCError(mints["error"])
+            if not isinstance(mints.get("result"), list):
+                raise FiroTransportError("invalid Spark mint list")
+            for mint in mints["result"]:
+                if not isinstance(mint, dict):
+                    raise FiroTransportError("invalid Spark mint")
+                if mint.get("txid") not in pending_txids:
+                    continue
+                if type(mint.get("isUsed")) is not bool or type(mint.get("nHeight")) is not int:
+                    raise FiroTransportError("invalid Spark mint state")
+                # Match getsparkbalance: spent and unconfirmed mints contribute nothing.
+                if not mint["isUsed"] and mint["nHeight"] >= 1:
+                    amount = firo_to_groth(mint.get("amount"))
                     if amount < 0:
-                        raise FiroTransportError("invalid Spark output for %s" % txid)
+                        raise FiroTransportError("invalid Spark mint amount")
                     pending_groth += amount
         assets = max(available - pending_groth, 0) + transparent_assets
         shortfall = max(liabilities - assets, 0)
@@ -566,18 +583,20 @@ class TipBot:
                 except (FiroRPCError, FiroTransportError):
                     logger.exception("admin funding address ownership could not be checked")
                     address = None
+            provisional = bool(pending_groth or inflight_mint or inflight_spend or uncertain_locks)
             message = (
-                "Wallet assets do not cover recorded liabilities. "
+                "Wallet finality-adjusted assets do not cover recorded liabilities. "
                 "Owed: %s FIRO; finality-adjusted wallet assets: %s FIRO; "
-                "shortfall: %s FIRO."
+                "%s: %s FIRO."
                 % (
                     format_groth(liabilities), format_groth(assets),
+                    "provisional coverage gap" if provisional else "shortfall",
                     format_groth(shortfall),
                 )
             )
             if pending_groth:
                 message += (
-                    " %s FIRO of wallet-owned Spark receipts is pending two "
+                    " %s FIRO of wallet-owned Spark outputs is pending two "
                     "confirmations and chainlock; recheck after finality before "
                     "sending additional funds."
                     % format_groth(pending_groth)
@@ -587,6 +606,12 @@ class TipBot:
                     " A wallet mint is unconfirmed; the displayed shortfall "
                     "may shrink when it finalizes. Recheck before topping up."
                 )
+            if inflight_spend:
+                message += (
+                    " A wallet spend is unconfirmed; its change is not yet "
+                    "included in finality-adjusted assets. Recheck after "
+                    "finality before topping up."
+                )
             if uncertain_locks:
                 message += (
                     " %s FIRO of locked withdrawal claims is unresolved; "
@@ -594,11 +619,12 @@ class TipBot:
                     % format_groth(uncertain_locks)
                 )
             if address:
-                if pending_groth or inflight_mint or uncertain_locks:
+                if provisional:
                     message += (
-                        " Once pending funds and claims are resolved, send any "
-                        "remaining shortfall net from an external wallet to the "
-                        "admin-only Spark address %s." % address
+                        " Wait for pending funds and claims to resolve, then "
+                        "recheck. If a shortfall remains, send that confirmed "
+                        "amount net from an external wallet to the admin-only "
+                        "Spark address %s." % address
                     )
                 else:
                     message += (
@@ -618,6 +644,7 @@ class TipBot:
                 or previous_alert.get("address") != address
                 or previous_alert.get("pending_groth") != pending_groth
                 or previous_alert.get("inflight_mint") != inflight_mint
+                or previous_alert.get("inflight_spend") != inflight_spend
                 or previous_alert.get("uncertain_locks_groth") != uncertain_locks
             ):
                 logger.error(message)
@@ -629,6 +656,7 @@ class TipBot:
                             "address": address,
                             "pending_groth": pending_groth,
                             "inflight_mint": inflight_mint,
+                            "inflight_spend": inflight_spend,
                             "uncertain_locks_groth": uncertain_locks,
                         }},
                         upsert=True,
@@ -1348,7 +1376,11 @@ class TipBot:
         for self.new_message in new_messages:
             query = getattr(self.new_message, "callback_query", None)
             message = self.new_message.message or (query.message if query else None)
-            if message is None or self.new_message.effective_user is None:
+            sender = self.new_message.effective_user
+            if (message is None or sender is None
+                    or sender.id in NON_HUMAN_USER_IDS
+                    or (self.new_message.message is not None
+                        and getattr(message, "sender_chat", None) is not None)):
                 continue
             try:
                 time.sleep(0.5)
@@ -1356,9 +1388,9 @@ class TipBot:
                 self.text, self._is_video = self.get_action(self.new_message)
                 self.message_text = str(self.text).lower()
                 # init user data
-                self.first_name = self.new_message.effective_user.first_name
-                self.username = self.new_message.effective_user.username
-                self.user_id = int(self.new_message.effective_user.id)
+                self.first_name = sender.first_name
+                self.username = sender.username
+                self.user_id = int(sender.id)
 
                 self.firo_address, self.balance_in_firo, self.locked_in_firo, self.is_withdraw = self.get_user_data()
                 self.balance_in_groth = (
@@ -1369,11 +1401,6 @@ class TipBot:
                 user = self.col_users.find_one({"_id": self.user_id})
                 self._is_verified = bool(user and user.get('IsVerified'))
                 self._is_user_in_db = self._is_verified
-                #
-                print(self.username)
-                print(self.user_id)
-                print(self.first_name)
-                print(self.message_text, '\n')
                 self.group_id = self.message.chat.id
                 self.group_username = self.get_group_username()
 
@@ -1388,8 +1415,11 @@ class TipBot:
                 self.action_processing(str(split[0]).lower(), args)
                 # self.check_group_msg()
             except Exception as exc:
-                print(exc)
-                traceback.print_exc()
+                logger.error(
+                    "Telegram update %s failed (%s)",
+                    getattr(self.new_message, "update_id", "unknown"),
+                    type(exc).__name__,
+                )
                 return False
         return True
 
@@ -1820,7 +1850,9 @@ class TipBot:
     def apply_deposits(self, transaction, own_mint=False):
         txid = transaction["txid"]
         scan_id = "deposit-scan:%s" % txid
-        if self.col_txs.find_one({"_id": scan_id}):
+        scanned = self.col_txs.find_one({"_id": scan_id})
+        if scanned:
+            self.announce_admin_funding(scanned)
             return
 
         legacy = self.col_txs.find_one(
@@ -1977,10 +2009,18 @@ class TipBot:
             },
             upsert=True,
         )
-        if admin_funding_groth:
-            self.send_to_logs(
-                "Admin funding of %s FIRO confirmed in transaction %s"
-                % (format_groth(admin_funding_groth), txid)
+        self.announce_admin_funding(self.col_txs.find_one({"_id": scan_id}))
+
+    def announce_admin_funding(self, scan):
+        if not scan or not scan.get("admin_funding_groth") or scan.get("admin_funding_announced_at"):
+            return
+        if self.send_to_logs(
+            "Admin funding of %s FIRO confirmed in transaction %s"
+            % (format_groth(scan["admin_funding_groth"]), scan["txId"])
+        ):
+            self.col_txs.update_one(
+                {"_id": scan["_id"], "admin_funding_announced_at": {"$exists": False}},
+                {"$set": {"admin_funding_announced_at": datetime.datetime.utcnow()}},
             )
 
     def report_withdrawal_once(self, sender, reason):
@@ -2065,6 +2105,16 @@ class TipBot:
     def reconcile_withdrawals(self, transactions):
         now = datetime.datetime.utcnow()
         completed_check_failed = False
+        # listtransactions already reports current finality for wallet spends.
+        # Keep gettransaction as a fallback if a completed spend is absent there.
+        spend_history = {
+            entry["txid"]: entry
+            for entry in transactions
+            if isinstance(entry, dict)
+            and entry.get("category") in ("spend", "send")
+            and isinstance(entry.get("txid"), str)
+            and entry["txid"]
+        }
         for sender in self.col_senders.find(
             {"schemaVersion": 2, "status": {"$in": ["reserved", "rejected"]}}
         ):
@@ -2118,7 +2168,15 @@ class TipBot:
                     completed_check_failed = True
                 continue
             try:
-                response = self.wallet_api.get_tx_status(txid)
+                transaction = spend_history.get(txid) if sender["status"] == "completed" else None
+                if (
+                    transaction is not None
+                    and type(transaction.get("confirmations")) is int
+                    and type(transaction.get("chainlock")) is bool
+                ):
+                    response = {"result": transaction, "error": None}
+                else:
+                    response = self.wallet_api.get_tx_status(txid)
                 if response.get("error"):
                     self.report_withdrawal_once(sender, response["error"])
                     if sender["status"] == "completed":
@@ -2136,7 +2194,9 @@ class TipBot:
                 elif status == "completed":
                     if not final:
                         self.reverse_completed_withdrawal(sender, confirmations)
-                    else:
+                    elif any(key in sender for key in (
+                        "review_required", "review_reason", "reviewReportedAt"
+                    )):
                         self.col_senders.update_one(
                             {"_id": sender["_id"], "status": "completed"},
                             {
@@ -2719,10 +2779,11 @@ class TipBot:
         try:
             reply = getattr(self.message, "reply_to_message", None)
             recipient = getattr(reply, "from_user", None)
-            if recipient is None:
+            if (recipient is None or recipient.id in NON_HUMAN_USER_IDS
+                    or getattr(reply, "sender_chat", None) is not None):
                 self.send_message(
                     self.user_id,
-                    "<b>Reply to a message sent by a Telegram user, not a channel.</b>",
+                    "<b>Reply to a message sent by a Telegram user, not a channel or anonymous admin.</b>",
                     parse_mode="HTML",
                 )
                 return
@@ -2752,6 +2813,13 @@ class TipBot:
             addrees - user address
             amount - amount of a tip
         """
+        if user_id in NON_HUMAN_USER_IDS:
+            self.send_message(
+                self.user_id,
+                "<b>Tips can only be sent to a Telegram user.</b>",
+                parse_mode='HTML',
+            )
+            return
         if self.user_id == user_id:
             self.send_message(
                 self.user_id,
