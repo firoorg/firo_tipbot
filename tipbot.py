@@ -335,8 +335,6 @@ class TipBot:
         self.stop_jobs.set()
         if self.scheduler_thread is not None:
             self.scheduler_thread.join()
-            if self.scheduler_thread.is_alive():
-                return  # Leave ownership in place while accounting work can still run.
         try:
             self.col_state.delete_one({"_id": "bot_owner", "owner_id": self.owner_id})
         except Exception:
@@ -527,20 +525,14 @@ class TipBot:
             confirmations = entry.get("confirmations", 0)
             if type(confirmations) is not int:
                 raise RuntimeError("wallet history contains invalid confirmations")
+            category = entry.get("category")
+            if confirmations == 0 and entry.get("abandoned") is not True:
+                if category == "mint":
+                    inflight_mint = True
+                elif category == "spend":
+                    inflight_spend = True
             if (
-                entry.get("category") == "mint"
-                and confirmations == 0
-                and entry.get("abandoned") is not True
-            ):
-                inflight_mint = True
-            if (
-                entry.get("category") == "spend"
-                and confirmations == 0
-                and entry.get("abandoned") is not True
-            ):
-                inflight_spend = True
-            if (
-                entry.get("category") in ("receive", "spend")
+                category in ("receive", "spend")
                 and confirmations >= 1
                 and not is_final_transaction(entry)
             ):
@@ -2110,10 +2102,7 @@ class TipBot:
         spend_history = {
             entry["txid"]: entry
             for entry in transactions
-            if isinstance(entry, dict)
-            and entry.get("category") in ("spend", "send")
-            and isinstance(entry.get("txid"), str)
-            and entry["txid"]
+            if entry.get("category") in ("spend", "send")
         }
         for sender in self.col_senders.find(
             {"schemaVersion": 2, "status": {"$in": ["reserved", "rejected"]}}
@@ -2776,35 +2765,23 @@ class TipBot:
         """
             Send a tip to user in the chat
         """
-        try:
-            reply = getattr(self.message, "reply_to_message", None)
-            recipient = getattr(reply, "from_user", None)
-            if (recipient is None or recipient.id in NON_HUMAN_USER_IDS
-                    or getattr(reply, "sender_chat", None) is not None):
-                self.send_message(
-                    self.user_id,
-                    "<b>Reply to a message sent by a Telegram user, not a channel or anonymous admin.</b>",
-                    parse_mode="HTML",
-                )
-                return
-            try:
-                amount = parse_amount(amount)
-            except ValueError as exc:
-                self.incorrect_parametrs_image()
-                print(exc)
-                return
-
-            self.send_tip(
-                recipient.id,
-                amount,
-                _type,
-                comment
+        reply = getattr(self.message, "reply_to_message", None)
+        recipient = getattr(reply, "from_user", None)
+        if (recipient is None or recipient.id in NON_HUMAN_USER_IDS
+                or getattr(reply, "sender_chat", None) is not None):
+            self.send_message(
+                self.user_id,
+                "<b>Reply to a message sent by a Telegram user, not a channel or anonymous admin.</b>",
+                parse_mode="HTML",
             )
+            return
+        try:
+            amount = parse_amount(amount)
+        except ValueError:
+            self.incorrect_parametrs_image()
+            return
 
-        except Exception as exc:
-            print(exc)
-            traceback.print_exc()
-            raise
+        self.send_tip(recipient.id, amount, _type, comment)
 
     def send_tip(self, user_id, amount, _type, comment):
         """

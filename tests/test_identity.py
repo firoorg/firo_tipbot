@@ -98,6 +98,19 @@ class IdentityTests(unittest.TestCase):
         self.assertNotIn("secret-withdrawal-address", str(logged.call_args))
         self.assertIn("42", str(logged.call_args))
 
+    def test_reply_tip_error_does_not_print_private_text(self):
+        bot = self.prepared_bot(1)
+        bot.message = SimpleNamespace(reply_to_message=SimpleNamespace(
+            from_user=User(id=2, first_name="Recipient", is_bot=False),
+            sender_chat=None,
+        ))
+        bot.send_tip = Mock(side_effect=RuntimeError("private-tip-comment"))
+
+        with patch("builtins.print") as printed, self.assertRaises(RuntimeError):
+            bot.tip_in_the_chat("0.1")
+
+        printed.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

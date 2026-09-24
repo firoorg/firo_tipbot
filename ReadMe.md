@@ -53,7 +53,6 @@ cloned the repository:
 Description=firotipbot
 After=network.target
 After=mongod.service
-Requires=mongod.service
 
 
 [Service]

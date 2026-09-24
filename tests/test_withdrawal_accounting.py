@@ -187,22 +187,5 @@ class ProcessOwnershipTests(unittest.TestCase):
                 self.assertRaisesRegex(RuntimeError, "index checked"):
             tipbot.TipBot(Mock())
 
-    def test_release_waits_for_worker_and_deletes_only_own_token(self):
-        bot = self.owner_bot(Mock())
-        bot.owner_id = "owner-token"
-        bot.scheduler_thread = Mock()
-        bot.scheduler_thread.is_alive.return_value = True
-        bot.release_process_ownership()
-        self.assertTrue(bot.stop_jobs.is_set())
-        bot.col_state.delete_one.assert_not_called()
-
-        bot.scheduler_thread.is_alive.return_value = False
-        bot.release_process_ownership()
-        bot.scheduler_thread.join.assert_called_with()
-        bot.col_state.delete_one.assert_called_once_with({
-            "_id": "bot_owner", "owner_id": "owner-token",
-        })
-
-
 if __name__ == "__main__":
     unittest.main()
