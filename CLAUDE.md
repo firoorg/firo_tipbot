@@ -7,9 +7,10 @@ Firo Tipbot is a **Telegram bot** that enables users to send and receive Firo cr
 ## Architecture
 
 ```
-tipbot.py                  # Main application — TipBot class + main() entry point (~1350 lines)
+tipbot.py                  # Main application — TipBot class + main() entry point
 api/firo_wallet_api.py     # Firo JSON-RPC wrapper (FiroWalletAPI class)
 services.json              # Configuration (MongoDB, bot token, RPC endpoint, i18n strings)
+tests/                     # Accounting and safety unit tests
 images/                    # Template PNG images for tip/deposit confirmation UI
 fonts/                     # ProximaNova TrueType fonts for image generation
 ```
@@ -17,7 +18,7 @@ fonts/                     # ProximaNova TrueType fonts for image generation
 ### Key patterns
 
 - **Single-file monolith**: All bot logic lives in `tipbot.py` inside the `TipBot` class
-- **Synchronous polling**: Uses `telegram.Bot` (python-telegram-bot v12) with manual `getUpdates` polling — no async/await
+- **Polling**: `SyncBot` bridges python-telegram-bot's async API to the main blocking polling loop
 - **Scheduled tasks**: `schedule` library runs in a background thread:
   - `update_balance()` every 60 seconds — monitors blockchain for deposits
   - `automintunspent()` every 300 seconds — anonymizes transparent funds
@@ -30,17 +31,17 @@ fonts/                     # ProximaNova TrueType fonts for image generation
 2. Commands are parsed and dispatched to handler methods
 3. Tips modify MongoDB balances directly (no on-chain tx)
 4. Withdrawals call `spendspark()` RPC and track confirmations
-5. Deposits detected by polling `listsparkmints()` and matching addresses
+5. Deposits detected through `listtransactions` and `getsparkcoinaddr`, then matched to user addresses
 
 ## Tech Stack
 
-- **Language**: Python 3.6+ (uses f-strings)
-- **Bot framework**: python-telegram-bot 12.2.0 (synchronous API)
-- **Database**: MongoDB via pymongo 3.11.4
+- **Language**: Python 3.10+
+- **Bot framework**: python-telegram-bot 22.8
+- **Database**: MongoDB replica set via pymongo 4.17.0
 - **Blockchain**: Firo node JSON-RPC via requests
-- **Image processing**: Pillow 8.2.0, matplotlib 3.4.2
+- **Image processing**: Pillow 12.3.0
 - **QR codes**: pyqrcode 1.2.1
-- **Task scheduling**: schedule 1.1.0
+- **Task scheduling**: schedule 1.2.2
 
 ## Running the Bot
 
@@ -50,7 +51,7 @@ pip3 install -r requirements.txt
 python3 tipbot.py
 ```
 
-**Prerequisites**: MongoDB running locally, Firo full node with RPC enabled.
+**Prerequisites**: MongoDB replica set and Firo Core 0.14.18.0+ with RPC enabled.
 
 For production, deploy as a systemd service (see `ReadMe.md`).
 
@@ -72,8 +73,8 @@ All configuration is in `services.json` (not environment variables):
 
 | Collection | Purpose |
 |------------|---------|
-| `users` | User profiles: `_id` (user_id), `username`, `Address` (array), `Balance`, `Locked`, `IsVerified` |
-| `txs` | Blockchain transactions: `txId`, type, confirmations, amount |
+| `users` | User profiles: `_id` (user_id), `Address` (array), integer `BalanceGroth` and `LockedGroth`, `IsVerified` |
+| `txs` | Deposit and withdrawal accounting events: `txId`, address, status, integer amount |
 | `senders` | Pending withdrawal tracking |
 | `tip_logs` | Tip transaction history |
 | `envelopes` | Red envelope state (group feature) |
@@ -82,17 +83,17 @@ All configuration is in `services.json` (not environment variables):
 
 ## Key Constants
 
-- `AV_FEE = 0.002` — Fixed withdrawal fee in FIRO
-- `SATS_IN_BTC = 1e8` — Satoshi conversion factor
-- Deposit confirmation threshold: **2 confirmations**
+- `WITHDRAW_FEE = 0.002` — Bot withdrawal fee in FIRO; the network fee is deducted from the recipient output
+- `GROTH_PER_FIRO = 100_000_000` — Integer accounting units per FIRO
+- Finality requires **2 confirmations and a chainlock**
 
 ## Bot Commands
 
 | Command | Context | Description |
 |---------|---------|-------------|
 | `/start` | DM | Register user and create wallet |
-| `/tip @user amount` | DM/Group | Send a tip |
-| `/atip @user amount` | DM | Send an anonymous tip |
+| Reply with `/tip amount` | Group | Send a tip to the replied-to user |
+| Reply with `/atip amount` | Group | Send an anonymous tip |
 | `/balance` | DM | Check wallet balance |
 | `/deposit` | DM | Show deposit address with QR code |
 | `/withdraw addr amount` | DM | Withdraw to external address |
@@ -115,7 +116,7 @@ All configuration is in `services.json` (not environment variables):
 - Tips are **off-chain** (database-only); only deposits and withdrawals touch the blockchain
 - User addresses are stored as arrays in the `Address` field (supports address migration)
 - Startup migrates shared Spark addresses; `/deposit` validates and refreshes a user's address
-- No test suite exists — test changes manually against a testnet node (see `Testnet.md`)
+- Run `python -m unittest discover -s tests`; test wallet and database integration against testnet before deployment
 
 ### Files you should not modify without care
 - `services.json` — contains secrets and all i18n strings

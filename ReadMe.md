@@ -103,8 +103,13 @@ migration. Reset the setting to `false` after the first successful start.
 Legacy deposit records do not identify which user received the old credit.
 Before starting this version, reconcile every legacy deposit against the wallet
 and database backup, then convert each record to a verified output-level deposit
-event or resolve the affected balances manually. The bot refuses to start while
-untracked legacy deposit records remain, including on subsequent restarts.
+event or resolve the affected balances manually. A converted event must use
+`_id: "deposit:<txid>:<address>"`, the verified `txId`, `address`, `user_id`,
+positive integer `amount_groth`, `eventVersion: 2`, and `status: "confirmed"`
+or `"reversed"`. With the bot stopped, delete the old record and insert the
+canonical record without crediting the balance again.
+The bot refuses to start while noncanonical legacy deposit records remain,
+including on subsequent restarts.
 
 Run one bot process per database. The bot claims a unique `bot_owner` document
 in the `state` collection before migration or recovery and releases it on a

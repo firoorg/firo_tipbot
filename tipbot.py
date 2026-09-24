@@ -45,6 +45,7 @@ WITHDRAW_FEE = Decimal("0.002")
 MIN_ENVELOPE = Decimal("0.001")
 WITHDRAW_FEE_GROTH = 200_000
 MIN_ENVELOPE_GROTH = 100_000
+MAX_TIP_COMMENT_UTF16 = 1000  # Photo captions allow 1024 units including "Comment: ".
 
 with open('services.json') as conf_file:
     conf = json.load(conf_file)
@@ -60,6 +61,8 @@ point_to_pixels = 1.33
 bold = ImageFont.truetype(font="fonts/ProximaNova-Bold.ttf", size=int(18 * point_to_pixels))
 regular = ImageFont.truetype(font="fonts/ProximaNova-Regular.ttf", size=int(18 * point_to_pixels))
 bold_high = ImageFont.truetype(font="fonts/ProximaNova-Bold.ttf", size=int(26 * point_to_pixels))
+# Fits exact eight-decimal amounts in the 522px receipt templates.
+money_bold = ImageFont.truetype(font="fonts/ProximaNova-Bold.ttf", size=20)
 
 WELCOME_MESSAGE = """
 <b>Welcome to the Firo telegram tip bot!</b> 
@@ -328,11 +331,23 @@ class TipBot:
         return "%s:%s" % (prefix, update_id if update_id is not None else uuid.uuid4().hex)
 
     def require_offline_migration_confirmation(self):
-        if self.col_txs.find_one({"type": "deposit", "eventVersion": {"$ne": 2}}):
-            raise RuntimeError(
-                "legacy deposits lack reliable recipient provenance; reconcile "
-                "and convert them offline before starting this bot"
-            )
+        for event in self.col_txs.find({"type": "deposit"}):
+            txid = event.get("txId")
+            address = event.get("address")
+            if (
+                event.get("eventVersion") != 2
+                or not isinstance(txid, str) or not txid
+                or not isinstance(address, str) or not address
+                or event.get("_id") != "deposit:%s:%s" % (txid, address)
+                or event.get("user_id") is None
+                or type(event.get("amount_groth")) is not int
+                or not 0 < event["amount_groth"] <= MAX_GROTH
+                or event.get("status") not in ("confirmed", "reversed")
+            ):
+                raise RuntimeError(
+                    "legacy deposits lack canonical output-level records; "
+                    "reconcile and convert them offline before starting this bot"
+                )
         state = self.col_state.find_one({"_id": "money_schema"})
         if state and state.get("status") == "complete":
             if state.get("version") != 1:
@@ -1398,7 +1413,7 @@ class TipBot:
                 continue
 
             self.create_receive_tips_image(
-                user["_id"], "{0:.8f}".format(amount), "Deposit", is_deposit=True
+                user["_id"], format_groth(amount_groth), "Deposit", is_deposit=True
             )
             print(
                 "*Deposit Success*\nBalance of address %s increased by %s FIRO."
@@ -1502,6 +1517,7 @@ class TipBot:
 
     def reconcile_withdrawals(self, transactions):
         now = datetime.datetime.utcnow()
+        completed_check_failed = False
         for sender in self.col_senders.find(
             {"schemaVersion": 2, "status": {"$in": ["reserved", "rejected"]}}
         ):
@@ -1551,11 +1567,15 @@ class TipBot:
             txid = sender.get("txId")
             if not txid:
                 self.report_withdrawal_once(sender, "missing transaction id")
+                if sender["status"] == "completed":
+                    completed_check_failed = True
                 continue
             try:
                 response = self.wallet_api.get_tx_status(txid)
                 if response.get("error"):
                     self.report_withdrawal_once(sender, response["error"])
+                    if sender["status"] == "completed":
+                        completed_check_failed = True
                     continue
                 transaction = response["result"]
                 confirmations = transaction.get("confirmations", 0)
@@ -1567,9 +1587,9 @@ class TipBot:
                     elif confirmations < 0 and status != "conflicted":
                         self.mark_withdrawal_conflicted(sender)
                 elif status == "completed":
-                    if confirmations < 2:
+                    if not final:
                         self.reverse_completed_withdrawal(sender, confirmations)
-                    elif final:
+                    else:
                         self.col_senders.update_one(
                             {"_id": sender["_id"], "status": "completed"},
                             {
@@ -1582,6 +1602,10 @@ class TipBot:
                         )
             except Exception as exc:
                 self.report_withdrawal_once(sender, exc)
+                if sender["status"] == "completed":
+                    completed_check_failed = True
+        if completed_check_failed:
+            raise FiroTransportError("completed withdrawal finality could not be verified")
 
     def release_user_lock(self, session, user_id, amount_groth, refund=False):
         user = self.col_users.find_one({"_id": user_id}, session=session)
@@ -2194,6 +2218,9 @@ class TipBot:
         except ValueError:
             self.incorrect_parametrs_image()
             return
+        if len(comment.encode("utf-16-le")) // 2 > MAX_TIP_COMMENT_UTF16:
+            self.send_message(self.user_id, "Tip comment is too long; please shorten it.")
+            return
         amount = groth_to_float(amount_groth)
 
         receiver = self.col_users.find_one(
@@ -2278,13 +2305,13 @@ class TipBot:
         sender_name = "Anonymous" if _type == 'anonymous' else self.first_name
         self.create_send_tips_image(
             self.user_id,
-            "{0:.8f}".format(amount),
+            format_groth(amount_groth),
             receiver.get('first_name') or str(user_id),
             comment,
         )
         self.create_receive_tips_image(
             receiver['_id'],
-            "{0:.8f}".format(amount),
+            format_groth(amount_groth),
             sender_name,
             comment,
         )
@@ -2300,12 +2327,12 @@ class TipBot:
             if is_deposit:
                 d.text(location_f, "%s" % first_name, font=bold, fill='#000000')
                 d.text(location_s, "has recharged", font=regular, fill='#000000')
-                d.text(location_t, "%s Firo" % "{0:.4f}".format(float(amount)), font=bold, fill='#000000')
 
             else:
                 d.text(location_f, "%s" % first_name, font=bold, fill='#000000')
                 d.text(location_s, "sent you a tip of", font=regular, fill='#000000')
-                d.text(location_t, "%s Firo" % "{0:.4f}".format(float(amount)), font=bold, fill='#000000')
+            d.text(location_t, "%s Firo" % amount.rstrip("0").rstrip("."),
+                   font=money_bold, fill='#000000')
 
             receive_img = self.image_buffer(im)
             if comment == "":
@@ -2341,7 +2368,8 @@ class TipBot:
             location_f = (276, 21)
             location_s = (276, 45)
             location_t = (276, 67)
-            d.text(location_f, "%s Firo" % "{0:.4f}".format(float(amount)), font=bold, fill='#000001')
+            d.text(location_f, "%s Firo" % amount.rstrip("0").rstrip("."),
+                   font=money_bold, fill='#000001')
             d.text(location_s, "tip was sent to", font=regular, fill='#000000')
             d.text(location_t, "%s" % first_name, font=bold, fill='#000000')
             send_img = self.image_buffer(im)
@@ -2380,7 +2408,8 @@ class TipBot:
 
             d.text(location_transfer, "Transaction transfer", font=regular,
                    fill='#000000')
-            d.text(location_amount, "%s Firo" % amount, font=bold, fill='#000001')
+            d.text(location_amount, "%s Firo" % amount.rstrip("0").rstrip("."),
+                   font=money_bold, fill='#000001')
             d.text(location_addess, "to %s..." % address[:8], font=bold,
                    fill='#000000')
             self.bot.send_photo(
@@ -2473,7 +2502,8 @@ class TipBot:
             location_addess = (205, 95)
 
             d.text(location_transfer, "You caught", font=bold, fill='#000000')
-            d.text(location_amount, "%s Firo" % amount, font=bold, fill='#f72c56')
+            d.text(location_amount, "%s Firo" % amount.rstrip("0").rstrip("."),
+                   font=money_bold, fill='#f72c56')
             d.text(location_addess, "FROM A RED ENVELOPE", font=regular, fill='#000000')
             try:
                 self.bot.send_photo(

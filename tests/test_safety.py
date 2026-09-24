@@ -132,6 +132,7 @@ class MemoryCollection:
 
 def ready_bot():
     bot = tipbot.TipBot.__new__(tipbot.TipBot)
+    bot.bot = Mock()
     bot.reconciliation_ok = True
     bot.col_txs = MemoryCollection()
     bot.col_users = MemoryCollection()
@@ -1006,7 +1007,7 @@ class SafetyTests(unittest.TestCase):
             bot.col_senders.documents["withdraw:20"]["status"], "completed"
         )
 
-        current["result"] = {"confirmations": 1, "chainlock": False}
+        current["result"] = {"confirmations": 2, "chainlock": False}
         bot.reconcile_withdrawals([])
         self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 100_000_000)
         self.assertEqual(
@@ -1146,6 +1147,25 @@ class SafetyTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "legacy deposits"):
             bot.require_offline_migration_confirmation()
+
+    def test_relabeling_legacy_deposit_cannot_bypass_replay_guard(self):
+        bot = ready_bot()
+        bot.col_state = MemoryCollection(
+            [{"_id": "money_schema", "status": "complete", "version": 1}]
+        )
+        converted = {
+            "_id": "legacy-random", "txId": "tx", "address": "address",
+            "user_id": 1, "amount_groth": 100_000_000,
+            "type": "deposit", "eventVersion": 2, "status": "confirmed",
+        }
+        bot.col_txs = MemoryCollection([converted])
+
+        with self.assertRaisesRegex(RuntimeError, "canonical output-level"):
+            bot.require_offline_migration_confirmation()
+
+        converted["_id"] = "deposit:tx:address"
+        bot.col_txs = MemoryCollection([converted])
+        bot.require_offline_migration_confirmation()
 
     def test_legacy_envelope_refund_reads_remainder_inside_transaction(self):
         bot = ready_bot()
@@ -1440,9 +1460,21 @@ class SafetyTests(unittest.TestCase):
         with patch.object(tipbot.Image, "open"), patch.object(
             tipbot.ImageDraw, "Draw", return_value=drawing
         ):
-            bot.create_receive_tips_image(2, "1.00000000", "Deposit")
+            bot.create_receive_tips_image(2, "0.00000001", "Deposit")
 
         self.assertEqual(drawing.text.call_args_list[1].args[1], "sent you a tip of")
+        self.assertEqual(drawing.text.call_args_list[2].args[1], "0.00000001 Firo")
+
+    def test_oversized_tip_comment_is_rejected_before_transfer(self):
+        bot = ready_bot()
+        bot.user_id = 1
+        bot.send_message = Mock()
+        bot.run_transaction = Mock()
+
+        bot.send_tip(2, "0.1", None, "🪙" * 501)
+
+        bot.run_transaction.assert_not_called()
+        self.assertIn("too long", bot.send_message.call_args.args[1])
 
     def test_html_is_escaped(self):
         self.assertEqual(

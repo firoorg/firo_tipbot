@@ -174,6 +174,31 @@ class AccountingTests(unittest.TestCase):
             bot.update_balance()
         self.assertTrue(bot.outgoing_paused())
 
+    def test_completed_withdrawal_lookup_failure_pauses_outgoing_funds(self):
+        bot = ready_bot()
+        bot.col_senders = MemoryCollection([{
+            "_id": "withdraw:1", "schemaVersion": 2, "status": "completed",
+            "user_id": 1, "txId": "tx1",
+        }])
+        bot.wallet_api = SimpleNamespace(
+            get_txs_list=Mock(return_value={"result": [], "error": None}),
+            get_tx_status=Mock(return_value={
+                "result": None, "error": {"code": -5, "message": "not found"},
+            }),
+        )
+        bot.send_to_logs = Mock()
+
+        with self.assertRaises(FiroTransportError):
+            bot.update_balance()
+        self.assertTrue(bot.outgoing_paused())
+        self.assertTrue(bot.col_senders.documents["withdraw:1"]["review_required"])
+
+        bot.wallet_api.get_tx_status.return_value = {
+            "result": {"confirmations": 2, "chainlock": True}, "error": None,
+        }
+        bot.update_balance()
+        self.assertFalse(bot.outgoing_paused())
+
     def test_completed_money_migration_does_not_access_account_collections(self):
         bot = ready_bot()
         state = {"_id": "money_schema", "version": 1, "status": "complete"}
