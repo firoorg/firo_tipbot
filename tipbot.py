@@ -211,6 +211,10 @@ class TipBot:
         # Legacy failed RPCs stored explicit null IDs, which sparse indexes include.
         self.col_senders.update_many({"txId": None}, {"$unset": {"txId": ""}})
         self.col_senders.create_index("txId", unique=True, sparse=True)
+        self.verify_wallet_spends(
+            self.wallet_api.list_spark_spends(),
+            self.wallet_api.get_txs_list(),
+        )
         self.migrate_deposit_addresses()
         self.col_users.create_index(
             "Address",
@@ -219,6 +223,7 @@ class TipBot:
             name="unique_deposit_address",
         )
         self.migrate_money_schema()
+        self.verify_solvency()
         self.col_users.create_index("BalanceGroth", name="negative_balance_guard")
         self.col_txs.create_index(
             [("type", 1), ("status", 1), ("review_required", 1)],
@@ -326,11 +331,105 @@ class TipBot:
             is not None
         )
 
+    def verify_wallet_spends(self, spark_spends, history):
+        if history.get("error"):
+            raise RuntimeError(history["error"])
+        if not isinstance(history.get("result"), list):
+            raise RuntimeError("wallet history is incomplete")
+        txids = set()
+        for entry in spark_spends:
+            txid = entry.get("txid") if isinstance(entry, dict) else None
+            if not isinstance(txid, str) or not txid:
+                raise RuntimeError("listsparkspends returned a spend without a transaction id")
+            txids.add(txid)
+        for entry in history["result"]:
+            if not isinstance(entry, dict):
+                raise RuntimeError("wallet history contains an invalid transaction")
+            if entry.get("category") in ("spend", "send"):
+                txid = entry.get("txid")
+                if not isinstance(txid, str) or not txid:
+                    raise RuntimeError("wallet history contains a spend without a transaction id")
+                txids.add(txid)
+        known = {
+            sender["txId"]
+            for sender in self.col_senders.find({
+                "status": {"$in": [
+                    "pending", "completed", "broadcasting", "unknown",
+                    "reorged", "conflicted",
+                ]}
+            })
+            if isinstance(sender.get("txId"), str)
+            and sender["txId"]
+            and sender.get("user_id") is not None
+            and sender.get("schemaVersion") == 2
+            and sender.get("legacy") is not True
+        }
+        unresolved = []
+        for txid in sorted(txids - known):
+            review = self.col_state.find_one({"_id": "wallet_spend_review:%s" % txid})
+            if (
+                review is not None
+                and review.get("balanceReconciled") is True
+                and isinstance(review.get("reviewNote"), str)
+                and review["reviewNote"].strip()
+            ):
+                continue
+            unresolved.append(txid)
+        if unresolved:
+            raise RuntimeError(
+                "%s wallet spend(s) lack a verified withdrawal accounting "
+                "record or balance review: %s" % (
+                    len(unresolved), ", ".join(unresolved[:10])
+                )
+            )
+
+    def verify_solvency(self):
+        liabilities = 0
+        for user in self.col_users.find({}):
+            balance = user["BalanceGroth"]
+            groth_to_decimal(balance)
+            liabilities += max(balance, 0)
+        for envelope in self.col_envelopes.find({}):
+            remains = envelope["remains_groth"]
+            groth_to_decimal(remains)
+            if remains < 0:
+                raise RuntimeError("envelope has a negative remainder")
+            liabilities += remains
+        # These withdrawals have not left the wallet and can be refunded.
+        for sender in self.col_senders.find({
+            "schemaVersion": 2, "status": {"$in": ["reserved", "rejected"]}
+        }):
+            locked = sender["locked_amount_groth"]
+            groth_to_decimal(locked)
+            if locked < 0:
+                raise RuntimeError("withdrawal has a negative lock")
+            liabilities += locked
+
+        spark = self.wallet_api.get_spark_balance()
+        available = spark.get("availableBalance") if isinstance(spark, dict) else None
+        if type(available) is not int or available < 0:
+            raise RuntimeError("wallet returned an invalid Spark balance")
+        assets = available
+        unspent = self.wallet_api.list_confirmed_unspent()
+        if not isinstance(unspent, list):
+            raise RuntimeError("wallet returned invalid transparent outputs")
+        for output in unspent:
+            if not isinstance(output, dict):
+                raise RuntimeError("wallet returned an invalid transparent output")
+            if output.get("spendable") is True:
+                assets += firo_to_groth(output["amount"])
+        if liabilities > assets:
+            raise RuntimeError(
+                "wallet assets do not cover spendable account and envelope balances"
+            )
+
     def command_id(self, prefix):
         update_id = getattr(self.new_message, "update_id", None)
         return "%s:%s" % (prefix, update_id if update_id is not None else uuid.uuid4().hex)
 
     def require_offline_migration_confirmation(self):
+        state = self.col_state.find_one({"_id": "money_schema"})
+        complete = state and state.get("status") == "complete"
         for event in self.col_txs.find({"type": "deposit"}):
             txid = event.get("txId")
             address = event.get("address")
@@ -348,8 +447,16 @@ class TipBot:
                     "legacy deposits lack canonical output-level records; "
                     "reconcile and convert them offline before starting this bot"
                 )
-        state = self.col_state.find_one({"_id": "money_schema"})
-        if state and state.get("status") == "complete":
+            if not complete and (
+                type(event.get("legacyCreditPresent")) is not bool
+                or not isinstance(event.get("legacyReviewNote"), str)
+                or not event["legacyReviewNote"].strip()
+            ):
+                raise RuntimeError(
+                    "legacy deposit %s needs a verified prior-credit decision "
+                    "and review note" % event["_id"]
+                )
+        if complete:
             if state.get("version") != 1:
                 raise RuntimeError("unsupported completed money schema version")
             return
@@ -461,6 +568,7 @@ class TipBot:
                 },
             )
 
+        self.normalize_legacy_deposits()
         self.refund_legacy_envelopes()
 
         for sender in self.col_senders.find({"schemaVersion": 2}):
@@ -514,7 +622,7 @@ class TipBot:
             )
 
         for event in self.col_txs.find({"eventVersion": 2}):
-            if "amount" not in event:
+            if "amount" not in event and "amount_groth" not in event:
                 continue
             amount_groth = event.get("amount_groth")
             if amount_groth is None:
@@ -595,6 +703,7 @@ class TipBot:
                 },
             )
 
+        self.verify_solvency()
         self.col_state.update_one(
             {"_id": "money_schema"},
             {
@@ -607,6 +716,45 @@ class TipBot:
             },
             upsert=True,
         )
+
+    def normalize_legacy_deposits(self):
+        for event in self.col_txs.find({"type": "deposit"}):
+            def normalize(session, event_id=event["_id"]):
+                current = self.col_txs.find_one(
+                    {"_id": event_id, "legacyBalanceNormalized": {"$ne": True}},
+                    session=session,
+                )
+                if current is None:
+                    return
+                credited = current["status"] == "confirmed"
+                present = current["legacyCreditPresent"]
+                delta = (int(credited) - int(present)) * current["amount_groth"]
+                owner = self.col_users.find_one(
+                    {"_id": current["user_id"]}, session=session
+                )
+                if owner is None:
+                    raise RuntimeError("legacy deposit recipient disappeared")
+                groth_to_decimal(owner["BalanceGroth"] + delta)
+                if delta:
+                    changed = self.col_users.update_one(
+                        {"_id": current["user_id"]},
+                        {"$inc": {
+                            "BalanceGroth": delta,
+                            "Balance": groth_to_float(delta),
+                        }},
+                        session=session,
+                    )
+                    if changed.modified_count != 1:
+                        raise RuntimeError("legacy deposit recipient disappeared")
+                marked = self.col_txs.update_one(
+                    {"_id": event_id, "legacyBalanceNormalized": {"$ne": True}},
+                    {"$set": {"legacyBalanceNormalized": True}},
+                    session=session,
+                )
+                if marked.modified_count != 1:
+                    raise RuntimeError("legacy deposit normalization changed concurrently")
+
+            self.run_transaction(normalize)
 
     def refund_legacy_envelopes(self):
         for envelope in self.col_envelopes.find({"schemaVersion": {"$ne": 2}}):
@@ -1156,6 +1304,8 @@ class TipBot:
         if response.get("error"):
             raise RuntimeError(response["error"])
 
+        self.verify_wallet_spends(self.wallet_api.list_spark_spends(), response)
+
         transactions = response["result"]
         by_txid = {}
         for transaction in transactions:
@@ -1177,6 +1327,7 @@ class TipBot:
 
         self.reconcile_deposit_confirmations(by_txid)
         self.reconcile_withdrawals(transactions)
+        self.verify_solvency()
         self.reconciliation_ok = True
 
     def flag_deposit_for_review(self, event, reason):

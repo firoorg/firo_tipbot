@@ -93,6 +93,18 @@ class FiroWalletAPI:
     def listsparkmints(self):
         return self._rpc("listsparkmints", request_id=2)
 
+    def list_spark_spends(self):
+        spends = self._result("listsparkspends", request_id=2)
+        if not isinstance(spends, list):
+            raise FiroTransportError("listsparkspends returned a non-list result")
+        return spends
+
+    def get_spark_balance(self):
+        return self._result("getsparkbalance")
+
+    def list_confirmed_unspent(self):
+        return self._result("listunspent", [1, 9999999, [], False])
+
     def get_wallet_status(self):
         return self._rpc("getinfo", request_id=6)
 

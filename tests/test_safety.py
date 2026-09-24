@@ -136,6 +136,8 @@ def ready_bot():
     bot.reconciliation_ok = True
     bot.col_txs = MemoryCollection()
     bot.col_users = MemoryCollection()
+    bot.col_senders = MemoryCollection()
+    bot.col_envelopes = MemoryCollection()
     bot.col_state = MemoryCollection()
     return bot
 
@@ -1086,6 +1088,116 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("tx21", sender["review_reason"])
         self.assertEqual(bot.col_users.documents[1]["LockedGroth"], 100_000_000)
 
+    def test_unrecorded_wallet_spend_blocks_reconciliation(self):
+        bot = ready_bot()
+        bot.col_senders = MemoryCollection()
+        bot.wallet_api = SimpleNamespace(
+            list_spark_spends=lambda: [],
+            get_spark_balance=lambda: {"availableBalance": 0},
+            list_confirmed_unspent=lambda: [],
+            get_txs_list=lambda: {
+                "result": [{"txid": "orphan-spend", "category": "spend", "amount": -1.0}],
+                "error": None,
+            }
+        )
+
+        with self.assertRaises(RuntimeError):
+            bot.update_balance()
+
+        self.assertFalse(bot.reconciliation_ok)
+        self.assertTrue(bot.outgoing_paused())
+
+    def test_recorded_wallet_spend_allows_reconciliation(self):
+        bot = ready_bot()
+        bot.col_senders = MemoryCollection(
+            [{
+                "_id": "withdraw:known", "schemaVersion": 2,
+                "status": "completed", "user_id": 1, "txId": "known-spend",
+            }]
+        )
+        bot.wallet_api = SimpleNamespace(
+            list_spark_spends=lambda: [],
+            get_spark_balance=lambda: {"availableBalance": 0},
+            list_confirmed_unspent=lambda: [],
+            get_txs_list=lambda: {
+                "result": [{"txid": "known-spend", "category": "spend", "amount": -1.0}],
+                "error": None,
+            },
+            get_tx_status=lambda txid: {
+                "result": {"confirmations": 2, "chainlock": True},
+                "error": None,
+            },
+        )
+
+        bot.update_balance()
+
+        self.assertTrue(bot.reconciliation_ok)
+        self.assertFalse(bot.outgoing_paused())
+
+    def test_underfunded_wallet_blocks_reconciliation_without_spend(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection([{"_id": 1, "Balance": 1.0}])
+        bot.wallet_api = SimpleNamespace(
+            get_txs_list=lambda: {"result": [], "error": None},
+            list_spark_spends=lambda: [],
+            get_spark_balance=lambda: {"availableBalance": 50_000_000},
+            list_confirmed_unspent=lambda: [],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "assets do not cover"):
+            bot.update_balance()
+
+        self.assertFalse(bot.reconciliation_ok)
+        self.assertTrue(bot.outgoing_paused())
+
+        with self.assertRaisesRegex(RuntimeError, "assets do not cover"):
+            bot.migrate_money_schema()
+        self.assertNotIn("money_schema", bot.col_state.documents)
+
+    def test_wallet_spend_preflight_requires_review_for_spark_only_spend(self):
+        bot = ready_bot()
+        bot.col_senders = MemoryCollection()
+        spark_spends = [{"txid": "spark-orphan"}]
+        history = {"result": [], "error": None}
+
+        with self.assertRaisesRegex(RuntimeError, "spark-orphan"):
+            bot.verify_wallet_spends(spark_spends, history)
+
+        bot.col_state.insert_one({
+            "_id": "wallet_spend_review:spark-orphan",
+            "balanceReconciled": True,
+        })
+        with self.assertRaisesRegex(RuntimeError, "spark-orphan"):
+            bot.verify_wallet_spends(spark_spends, history)
+
+        bot.col_state.documents["wallet_spend_review:spark-orphan"]["reviewNote"] = (
+            "wallet spend and affected user balance reconciled"
+        )
+        bot.verify_wallet_spends(spark_spends, history)
+
+    def test_legacy_sender_spend_requires_review_before_and_after_migration(self):
+        bot = ready_bot()
+        spend = [{"txid": "legacy-spend"}]
+        history = {"result": [], "error": None}
+        for sender in (
+            {"_id": "legacy", "status": "pending", "user_id": 1,
+             "txId": "legacy-spend"},
+            {"_id": "legacy", "status": "pending", "user_id": 1,
+             "txId": "legacy-spend", "schemaVersion": 2, "legacy": True},
+        ):
+            with self.subTest(schema_version=sender.get("schemaVersion")):
+                bot.col_senders = MemoryCollection([sender])
+                bot.col_state = MemoryCollection()
+                with self.assertRaisesRegex(RuntimeError, "legacy-spend"):
+                    bot.verify_wallet_spends(spend, history)
+
+                bot.col_state.insert_one({
+                    "_id": "wallet_spend_review:legacy-spend",
+                    "balanceReconciled": True,
+                    "reviewNote": "legacy payout and user balance reconciled",
+                })
+                bot.verify_wallet_spends(spend, history)
+
     def test_legacy_lock_dust_is_removed_without_active_withdrawals(self):
         bot = ready_bot()
         bot.col_users = MemoryCollection(
@@ -1103,7 +1215,11 @@ class SafetyTests(unittest.TestCase):
         bot.col_envelopes = MemoryCollection()
         bot.col_txs = MemoryCollection()
         bot.col_state = MemoryCollection()
-        bot.wallet_api = SimpleNamespace(get_tx_status=Mock())
+        bot.wallet_api = SimpleNamespace(
+            get_tx_status=Mock(),
+            get_spark_balance=lambda: {"availableBalance": 900_000_000},
+            list_confirmed_unspent=lambda: [],
+        )
         bot.send_to_logs = Mock()
         bot.run_transaction = transaction_runner(
             bot.col_users,
@@ -1157,6 +1273,8 @@ class SafetyTests(unittest.TestCase):
             "_id": "legacy-random", "txId": "tx", "address": "address",
             "user_id": 1, "amount_groth": 100_000_000,
             "type": "deposit", "eventVersion": 2, "status": "confirmed",
+            "legacyCreditPresent": True,
+            "legacyReviewNote": "wallet output and credited balance checked",
         }
         bot.col_txs = MemoryCollection([converted])
 
@@ -1166,6 +1284,84 @@ class SafetyTests(unittest.TestCase):
         converted["_id"] = "deposit:tx:address"
         bot.col_txs = MemoryCollection([converted])
         bot.require_offline_migration_confirmation()
+
+    def test_reversed_legacy_deposit_requires_balance_review(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection(
+            [{"_id": 1, "Address": ["address"], "Balance": 1.0}]
+        )
+        bot.col_senders = MemoryCollection()
+        bot.col_envelopes = MemoryCollection()
+        bot.col_state = MemoryCollection()
+        event = {
+            "_id": "deposit:tx:address", "txId": "tx", "address": "address",
+            "user_id": 1, "amount_groth": 100_000_000,
+            "type": "deposit", "eventVersion": 2, "status": "reversed",
+        }
+        bot.col_txs = MemoryCollection([event])
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
+        bot.wallet_api = SimpleNamespace(
+            get_spark_balance=lambda: {"availableBalance": 0},
+            list_confirmed_unspent=lambda: [],
+        )
+
+        with patch.dict(tipbot.conf["mongo"], {"migrationConfirmedOffline": True}):
+            with self.assertRaises(RuntimeError):
+                bot.require_offline_migration_confirmation()
+
+            bot.col_txs.documents[event["_id"]]["legacyCreditPresent"] = True
+            with self.assertRaises(RuntimeError):
+                bot.require_offline_migration_confirmation()
+
+            bot.col_txs.documents[event["_id"]]["legacyReviewNote"] = (
+                "reversed wallet output and user balance checked"
+            )
+            bot.require_offline_migration_confirmation()
+
+        migrate_withdrawals = bot.migrate_legacy_pending_withdrawals
+        bot.migrate_legacy_pending_withdrawals = Mock(
+            side_effect=RuntimeError("later migration step failed")
+        )
+        with self.assertRaisesRegex(RuntimeError, "later migration step failed"):
+            bot.migrate_money_schema()
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
+        self.assertEqual(bot.col_users.documents[1]["Balance"], 0.0)
+        self.assertTrue(bot.col_txs.documents[event["_id"]]["legacyBalanceNormalized"])
+        self.assertNotIn("money_schema", bot.col_state.documents)
+
+        bot.migrate_legacy_pending_withdrawals = migrate_withdrawals
+        bot.migrate_money_schema()
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 0)
+        self.assertEqual(bot.col_state.documents["money_schema"]["status"], "complete")
+
+    def test_confirmed_legacy_deposit_missing_credit_is_applied_once(self):
+        bot = ready_bot()
+        bot.col_users = MemoryCollection(
+            [{"_id": 1, "Address": ["address"], "Balance": 0.0}]
+        )
+        bot.col_senders = MemoryCollection()
+        bot.col_envelopes = MemoryCollection()
+        bot.col_state = MemoryCollection()
+        event = {
+            "_id": "deposit:tx:address", "txId": "tx", "address": "address",
+            "user_id": 1, "amount_groth": 100_000_000,
+            "type": "deposit", "eventVersion": 2, "status": "confirmed",
+            "legacyCreditPresent": False,
+            "legacyReviewNote": "wallet output existed; old balance update did not",
+        }
+        bot.col_txs = MemoryCollection([event])
+        bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
+
+        with patch.dict(tipbot.conf["mongo"], {"migrationConfirmedOffline": True}):
+            bot.require_offline_migration_confirmation()
+
+        bot.normalize_legacy_deposits()
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 100_000_000)
+        self.assertEqual(bot.col_users.documents[1]["Balance"], 1.0)
+        self.assertTrue(bot.col_txs.documents[event["_id"]]["legacyBalanceNormalized"])
+
+        bot.normalize_legacy_deposits()
+        self.assertEqual(bot.col_users.documents[1]["BalanceGroth"], 100_000_000)
 
     def test_legacy_envelope_refund_reads_remainder_inside_transaction(self):
         bot = ready_bot()
@@ -1220,7 +1416,9 @@ class SafetyTests(unittest.TestCase):
             get_tx_status=lambda txid: {
                 "result": None,
                 "error": {"code": -5, "message": "not found"},
-            }
+            },
+            get_spark_balance=lambda: {"availableBalance": 900_000_000},
+            list_confirmed_unspent=lambda: [],
         )
         bot.send_to_logs = Mock()
         bot.run_transaction = transaction_runner(

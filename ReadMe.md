@@ -91,23 +91,52 @@ Use a connection string containing `?replicaSet=rs0`, as shown in
 `services.json`. The bot refuses to start against standalone MongoDB because
 standalone writes cannot safely move funds between accounts.
 
-Before the first start of this version, stop every old tipbot process and take
-a MongoDB backup. Set `mongo.migrationConfirmedOffline` to `true` in
-`services.json`, then start one updated process first. It converts balances to
-integer groth, refunds the unclaimed remainder of legacy red envelopes, and
-quarantines legacy withdrawals that cannot be reconstructed safely. The bot
-refuses to migrate an existing database without this explicit confirmation. Do
-not run old and new bot versions against the same database during this
-migration. Reset the setting to `false` after the first successful start.
+Before the first start of this version, stop every old tipbot process and back
+up both MongoDB and the Firo wallet. Reconcile wallet sends and deposits as
+described below, then set `mongo.migrationConfirmedOffline` to `true` in
+`services.json` and start one updated process. It converts balances to integer
+groth, refunds the unclaimed remainder of legacy red envelopes, and quarantines
+legacy withdrawals that cannot be reconstructed safely. Do not run old and new
+bot versions against the same database. Reset the setting to `false` after the
+first successful start.
+
+The old bot could send from the wallet before recording or debiting a withdrawal.
+Compare every wallet Spark spend (`listsparkspends`, deduplicated by `txid`) and
+other outgoing wallet-history entry with the `senders` and `txs` collections.
+Use the original wallet or a verified complete history; a missing transaction
+in a restored wallet is not proof that no payout occurred.
+For every old send, including one with a matching `senders` record, use the
+wallet details, logs, and database backup to verify the requested amount,
+recipient, fee, and the sender's balance and lock changes. The old bot could
+save a sender record before debiting the account, and its later completion
+could debit a different amount. Correct any discrepancy while the bot is
+stopped. If ownership or the balance effect cannot be proven, leave the bot
+stopped. After a verified correction or classification of a non-bot wallet
+send, record the decision in `state`:
+
+```
+{_id: "wallet_spend_review:<txid>", balanceReconciled: true,
+ reviewNote: "<evidence and balance correction>"}
+```
+
+Startup and recurring reconciliation reject old wallet spends without this
+review record. New withdrawals require a matching sender record. The review
+record is a manual attestation; it does not correct a balance itself.
 
 Legacy deposit records do not identify which user received the old credit.
-Before starting this version, reconcile every legacy deposit against the wallet
-and database backup, then convert each record to a verified output-level deposit
-event or resolve the affected balances manually. A converted event must use
-`_id: "deposit:<txid>:<address>"`, the verified `txId`, `address`, `user_id`,
-positive integer `amount_groth`, `eventVersion: 2`, and `status: "confirmed"`
-or `"reversed"`. With the bot stopped, delete the old record and insert the
-canonical record without crediting the balance again.
+Reconcile each deposit against wallet outputs, the database backup, and the
+current user balance. Replace the old record with a verified output-level event
+using `_id: "deposit:<txid>:<address>"`, the verified `txId`, `address`,
+`user_id`, positive integer `amount_groth`, `eventVersion: 2`, and status
+`"confirmed"` or `"reversed"`. Set `legacyCreditPresent: true` only if this
+verified amount was credited to this `user_id` and has not already been
+reversed, even if the user later tipped or withdrew it; otherwise set it to
+`false`. Correct any wrong recipient or wrong amount separately while offline.
+Add a nonempty `legacyReviewNote` explaining the evidence. Do not also apply
+the event's expected credit or reversal manually: the migration applies
+the difference between `legacyCreditPresent` and `status` exactly once in a
+MongoDB transaction. A reversed deposit whose old credit was spent may leave a
+negative account, which pauses outgoing transfers until resolved.
 The bot refuses to start while noncanonical legacy deposit records remain,
 including on subsequent restarts.
 
@@ -128,8 +157,13 @@ not automatically settle a withdrawal. Reconcile these cases against the
 wallet before assigning a transaction ID or refunding funds.
 
 Transfers and envelope claims pause when wallet reconciliation fails, a
-confirmed deposit needs review, or a reorg leaves any account negative. Resolve
-the underlying wallet or accounting issue before transfers resume.
+confirmed deposit needs review, a reorg leaves any account negative, or
+confirmed spendable wallet assets cannot cover positive user balances, envelope
+remainders, and unbroadcast withdrawal locks. Resolve the underlying wallet or
+accounting issue before transfers resume. This aggregate check cannot prove
+which user owns a legacy wallet send or deposit; review each historical event.
+It can also pause transfers temporarily while automint or withdrawal change is
+waiting for confirmation.
 
 The 0.002 FIRO bot fee is included in the command amount. The Firo network fee
 is deducted from the recipient output, so the amount shown before confirmation

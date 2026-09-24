@@ -27,7 +27,12 @@ class AccountingTests(unittest.TestCase):
             ]
         )
         bot.run_transaction = transaction_runner(bot.col_users, bot.col_txs)
-        bot.wallet_api = SimpleNamespace(get_tx_status=Mock())
+        bot.wallet_api = SimpleNamespace(
+            get_tx_status=Mock(),
+            list_spark_spends=Mock(return_value=[]),
+            get_spark_balance=Mock(return_value={"availableBalance": 1_000_000_000}),
+            list_confirmed_unspent=Mock(return_value=[]),
+        )
         bot.send_to_logs = Mock()
         return bot
 
@@ -182,6 +187,9 @@ class AccountingTests(unittest.TestCase):
         }])
         bot.wallet_api = SimpleNamespace(
             get_txs_list=Mock(return_value={"result": [], "error": None}),
+            list_spark_spends=Mock(return_value=[]),
+            get_spark_balance=Mock(return_value={"availableBalance": 0}),
+            list_confirmed_unspent=Mock(return_value=[]),
             get_tx_status=Mock(return_value={
                 "result": None, "error": {"code": -5, "message": "not found"},
             }),
@@ -220,7 +228,11 @@ class AccountingTests(unittest.TestCase):
         bot.col_envelopes = MemoryCollection()
         bot.col_txs = MemoryCollection()
         bot.col_state = MemoryCollection()
-        bot.wallet_api = SimpleNamespace(get_tx_status=Mock())
+        bot.wallet_api = SimpleNamespace(
+            get_tx_status=Mock(),
+            get_spark_balance=Mock(return_value={"availableBalance": 30_000_000}),
+            list_confirmed_unspent=Mock(return_value=[]),
+        )
         bot.run_transaction = transaction_runner(
             bot.col_users, bot.col_senders, bot.col_envelopes, bot.col_txs
         )
