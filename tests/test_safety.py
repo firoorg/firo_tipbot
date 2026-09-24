@@ -1359,7 +1359,7 @@ class SafetyTests(unittest.TestCase):
             ]
         )
         bot.col_state = MemoryCollection()
-        replacements = iter([["address-1"], ["address-2"]])
+        replacements = iter(["address-1", "address-2"])
         bot.wallet_api = SimpleNamespace(
             get_default_address=lambda: ["shared"],
             create_user_wallet=lambda: next(replacements),
