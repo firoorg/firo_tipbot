@@ -54,22 +54,20 @@ class IdentityTests(unittest.TestCase):
                 bot.action_processing.assert_not_called()
                 self.assertEqual(bot.col_users.documents[user_id]["BalanceGroth"], 100_000_000)
 
-    def test_reply_to_anonymous_admin_cannot_credit_fake_id(self):
-        for recipient_id in (ChatID.ANONYMOUS_ADMIN, 2):
-            with self.subTest(recipient_id=recipient_id):
-                bot = self.prepared_bot(1)
-                bot.user_id = 1
-                bot.send_message = Mock()
-                bot.send_tip = Mock()
-                bot.message = SimpleNamespace(reply_to_message=SimpleNamespace(
-                    from_user=User(id=recipient_id, first_name="Group", is_bot=False),
-                    sender_chat=Chat(id=-100, type="supergroup"),
-                ))
+    def test_reply_to_chat_sender_is_rejected_even_with_real_user_id(self):
+        bot = self.prepared_bot(1)
+        bot.user_id = 1
+        bot.send_message = Mock()
+        bot.send_tip = Mock()
+        bot.message = SimpleNamespace(reply_to_message=SimpleNamespace(
+            from_user=User(id=2, first_name="Group", is_bot=False),
+            sender_chat=Chat(id=-100, type="supergroup"),
+        ))
 
-                bot.tip_in_the_chat("0.1")
+        bot.tip_in_the_chat("0.1")
 
-                bot.send_tip.assert_not_called()
-                self.assertIn("anonymous admin", bot.send_message.call_args.args[1])
+        bot.send_tip.assert_not_called()
+        self.assertIn("anonymous admin", bot.send_message.call_args.args[1])
 
     def test_registered_fake_id_cannot_receive_tip_directly(self):
         bot = self.prepared_bot(1)

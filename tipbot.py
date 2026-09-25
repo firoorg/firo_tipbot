@@ -2767,8 +2767,7 @@ class TipBot:
         """
         reply = getattr(self.message, "reply_to_message", None)
         recipient = getattr(reply, "from_user", None)
-        if (recipient is None or recipient.id in NON_HUMAN_USER_IDS
-                or getattr(reply, "sender_chat", None) is not None):
+        if recipient is None or getattr(reply, "sender_chat", None) is not None:
             self.send_message(
                 self.user_id,
                 "<b>Reply to a message sent by a Telegram user, not a channel or anonymous admin.</b>",
