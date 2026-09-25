@@ -1,30 +1,58 @@
 ## How to deploy Firo Tip bot
 
+Use Ubuntu 22.04 or newer.
+
 Update Ubuntu packages
 <pre>sudo apt update</pre>
 <pre>sudo apt upgrade</pre>
 <pre>sudo apt-get install python3-dev python3-pip python3-virtualenv</pre>
 
+Python 3.10 or newer is required.
+
 Clone firo tip bot repo:
-<pre>git clone https://repo_link</pre>
+<pre>git clone https://github.com/firoorg/firo_tipbot.git</pre>
 <pre>cd firo_tipbot</pre>
 
 Install python requirement packages
-<pre>pip3 install -r requirements.txt</pre>
+<pre>python3 -m pip install -r requirements.txt</pre>
 
-To check if the bot works correct:
-<pre>python3 tipbot.py</pre>
-If there's not exceptions, use Ctrl+C to break the process.
+Use Firo Core 0.14.18.0 or newer. This release is required after the
+September 2026 hard fork and includes the corrected Spark address lookup.
+
+### Install MongoDB on Ubuntu
+
+Install MongoDB 6.0 or newer from the
+[official MongoDB installation guide](https://www.mongodb.com/docs/manual/administration/install-on-linux/).
+
+The tipbot uses MongoDB transactions for every multi-account balance change.
+Run MongoDB as a replica set, including on a single server. Add this to
+`/etc/mongod.conf`:
+
+<pre>
+replication:
+  replSetName: rs0
+</pre>
+
+Restart MongoDB and initialize the set once:
+
+<pre>sudo systemctl restart mongod</pre>
+<pre>mongosh --eval "rs.initiate()"</pre>
+<pre>sudo systemctl enable mongod</pre>
+
+Use a connection string containing `?replicaSet=rs0`, as shown in
+`services.json`. The bot refuses to start against standalone MongoDB because
+standalone writes cannot safely move funds between accounts.
 
 Configure TipBot init script
 <pre>vim /etc/systemd/system/tipbot.service</pre>
 
-Paste
+Paste the following, setting `WorkingDirectory` to the absolute path where you
+cloned the repository:
 <pre>
 [Unit]
 Description=firotipbot
 After=network.target
-After=mongodb.service
+After=mongod.service
 
 
 [Service]
@@ -34,7 +62,7 @@ ExecStart=/usr/bin/python3 tipbot.py
 EnvironmentFile=/etc/environment
 RestartSec=10
 SyslogIdentifier=tipbot
-TimeoutStopSec=120
+TimeoutStopSec=infinity
 TimeoutStartSec=2
 StartLimitInterval=120
 StartLimitBurst=5
@@ -47,70 +75,151 @@ PrivateTmp=true
 WantedBy=multi-user.target
 </pre>
 
-<pre>systemctl daemon-reload</pre>
+<pre>sudo systemctl daemon-reload</pre>
 
-Run the following systemctl command to start the MongoDB service:
+After completing the migration and backup steps below, start the tipbot service:
 <pre>sudo systemctl start tipbot.service</pre>
  
 Then check the service’s status.
 <pre>sudo systemctl status tipbot.service</pre>
 
-After confirming that the service is running as expected, enable the MongoDB service to start up at boot:
+After confirming that the service is running as expected, enable the tipbot
+service to start at boot:
 <pre>sudo systemctl enable tipbot.service</pre>
 
 To stop the service
 <pre>sudo systemctl stop tipbot.service</pre>
 
-### Install Mongodb on ubuntu
-#### Follow this manual:
-https://www.digitalocean.com/community/tutorials/how-to-install-mongodb-on-ubuntu-18-04-source
+Before the first start of this version, stop every old tipbot process and back
+up both MongoDB and the Firo wallet. Reconcile wallet sends, deposits, and
+off-chain transfers as described below, then set
+`mongo.migrationConfirmedOffline` to `true` in `services.json` and start one
+updated process. It converts balances to integer groth, refunds the unclaimed
+remainder of legacy red envelopes, and quarantines
+legacy withdrawals that cannot be reconstructed safely. Do not run old and new
+bot versions against the same database. Reset the setting to `false` after the
+first successful start.
 
-<pre>curl -fsSL https://www.mongodb.org/static/pgp/server-4.4.asc | sudo apt-key add -</pre>
-<pre>echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu bionic/mongodb-org/4.4 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-4.4.list</pre>
-<pre>sudo apt update</pre>
-<pre>sudo apt install mongodb-org</pre>
+The old bot could send from the wallet before recording or debiting a withdrawal.
+Compare every wallet Spark spend (`listsparkspends`, deduplicated by `txid`) and
+other outgoing wallet-history entry with the `senders` and `txs` collections.
+Use the original wallet or a verified complete history; a missing transaction
+in a restored wallet is not proof that no payout occurred.
+For every old send, including one with a matching `senders` record, use the
+wallet details, logs, and database backup to verify the requested amount,
+recipient, fee, and the sender's balance and lock changes. The old bot could
+save a sender record before debiting the account, and its later completion
+could debit a different amount. Correct any discrepancy while the bot is
+stopped. If ownership or the balance effect cannot be proven, leave the bot
+stopped. After a verified correction or classification of a non-bot wallet
+send, record the decision in `state`:
 
-Configure init script
-<pre>vim /etc/systemd/system/mongod.service</pre>
-<pre>
-[Unit]
-Description=High-performance, schema-free document-oriented database
-After=network.target
-Documentation=https://docs.mongodb.org/manual
+```
+{_id: "wallet_spend_review:<txid>", balanceReconciled: true,
+ reviewNote: "<evidence and balance correction>"}
+```
 
-[Service]
-User=mongodb
-Group=mongodb
-ExecStart=/usr/bin/mongod --quiet --config /etc/mongod.conf
-RestartSec=10
-TimeoutStopSec=120
-TimeoutStartSec=2
-StartLimitInterval=120
-StartLimitBurst=5
-TasksMax=infinity
-TasksAccounting=false
-KillMode=mixed
-Restart=always
-PrivateTmp=true
+Startup and recurring reconciliation reject old wallet spends without this
+review record. New withdrawals require a matching sender record. The review
+record is a manual attestation; it does not correct a balance itself.
 
-[Install]
-WantedBy=multi-user.target
-</pre>
+Legacy deposit records do not identify which user received the old credit.
+Reconcile each deposit against wallet outputs, the database backup, and the
+current user balance. Replace the old record with a verified output-level event
+using `_id: "deposit:<txid>:<address>"`, the verified `txId`, `address`,
+`user_id`, positive integer `amount_groth`, `eventVersion: 2`, and status
+`"confirmed"` or `"reversed"`. Set `legacyCreditPresent: true` only if this
+verified amount was credited to this `user_id` and has not already been
+reversed, even if the user later tipped or withdrew it; otherwise set it to
+`false`. Correct any wrong recipient or wrong amount separately while offline.
+Add a nonempty `legacyReviewNote` explaining the evidence. Do not also apply
+the event's expected credit or reversal manually: the migration applies
+the difference between `legacyCreditPresent` and `status` exactly once in a
+MongoDB transaction. A reversed deposit whose old credit was spent may leave a
+negative account, which pauses outgoing transfers until resolved. A legacy
+locked balance without a matching withdrawal is preserved and quarantined for
+review; it is included in the wallet coverage check.
+The bot refuses to start while noncanonical legacy deposit records remain,
+including on subsequent restarts.
 
+The old bot updated tip senders, recipients, and `tip_logs` in separate writes.
+It also recorded a red-envelope taker and reduced the remainder before
+crediting that taker. A crash or overwritten balance update can leave a user
+underpaid even when total wallet assets cover recorded balances. Review old
+tips and envelope claims against database backups and available logs, and
+correct any balance discrepancy while the bot is stopped. If migration has
+already started, correct both `BalanceGroth` (the authoritative integer amount)
+and its `Balance` mirror for each affected user. For each legacy envelope with
+takers or an unexplained decrease in its remainder, verify the claims before
+setting `legacyClaimsReviewed: true` and a nonempty `legacyClaimsReviewNote` on
+that envelope. The bot refuses to migrate an envelope with unreviewed claims;
+it automatically refunds the unclaimed remainder after review. If the
+historical balance effect cannot be established, keep the bot stopped rather
+than assume that aggregate wallet coverage proves each user's balance.
 
-<pre>systemctl daemon-reload</pre>
+```
+db.envelopes.updateOne({_id: "<envelope id>"}, {$set: {
+  legacyClaimsReviewed: true,
+  legacyClaimsReviewNote: "<claimants, amounts, evidence, and corrections>"
+}})
+```
 
-Run the following systemctl command to start the MongoDB service:
-<pre>sudo systemctl start mongod.service</pre>
- 
-Then check the service’s status.
-<pre>sudo systemctl status mongod.service</pre>
+Run one bot process per database. The bot claims a unique `bot_owner` document
+in the `state` collection before migration or recovery and releases it on a
+clean shutdown after the accounting worker stops. A second process refuses
+to start. After a crash or forced shutdown, stop and verify every bot process
+on every host before removing that stale document with
+`db.state.deleteOne({_id: "bot_owner"})` in the tipbot database. The record
+includes its host and process ID. Never remove it while a bot may still be
+running. Completed money migrations are not rerun on ordinary restarts.
 
-After confirming that the service is running as expected, enable the MongoDB service to start up at boot:
-<pre>sudo systemctl enable mongod.service</pre>
+Withdrawals with an uncertain RPC outcome retain their reserved funds and
+are marked for review. Generic wallet errors can occur after a transaction
+was stored, so they cannot establish that a refund is safe. Address, amount,
+and time matches are logged as candidates for manual verification. They do
+not automatically settle a withdrawal. Reconcile these cases against the
+wallet before assigning a transaction ID or refunding funds.
 
-To stop the service
-<pre>sudo systemctl stop mongod.service</pre>
+Transfers and envelope claims pause when wallet reconciliation fails, a
+confirmed deposit needs review, a reorg leaves any account negative, or
+confirmed spendable wallet assets cannot cover positive user balances, envelope
+remainders, unresolved withdrawal locks, and unassigned deposits. When assets
+fall short, the bot reports the FIRO coverage gap and funding instructions to
+the configured admin log (`log_ch` in `services.json`; configure an
+administrator-only chat). Startup errors also appear in the service log. On
+its first startup it creates a dedicated Spark funding address and saves it
+in `state` for reuse; deposits to this address fund the bot's
+reserve and are never credited to a user. Back up the wallet again after this
+address is generated so a restore retains it; startup checks that the saved
+address belongs to the active wallet. If Telegram delivery fails, read the
+saved address with `db.state.findOne({_id: "admin_funding_address"}).address`
+in `mongosh` only after confirming it appears in the active wallet's
+`getallsparkaddresses` result. Send at least the reported shortfall
+*net received* to that address from an external wallet, allowing for the
+sending wallet's network fee. Pending Spark receipts are excluded until final;
+unresolved withdrawal claims are counted conservatively, so review those before
+deciding the final top-up. The bot stays online with transfers paused during
+a funding-only shortfall and checks wallet assets
+periodically. It logs the top-up receipt after two confirmations and chainlock;
+the solvency check excludes nonfinal Spark receipts even if the wallet reports
+them as available. Do not top up through a user's `/deposit` address, since
+that also increases the amount owed
+to that user. A top-up does not establish ownership or resolve a legacy wallet
+send or deposit review; reconcile each historical event as described above.
+The aggregate check can also pause transfers temporarily while automint or
+withdrawal change is waiting for confirmation.
+
+The 0.002 FIRO bot fee is included in the command amount. The Firo network fee
+is deducted from the recipient output, so the amount shown before confirmation
+is a maximum rather than the exact received amount.
+
+The migration also replaces the old shared default deposit address. After
+startup, the bot sends replacement addresses in batches of five per minute
+and retries failed deliveries; users can also request theirs with `/deposit`.
+Any wallet-owned deposit output without a matching user address, apart from
+the dedicated admin funding address or an internal automint to the wallet's
+retired default address, is stored as a `deposit-orphan` review record and
+logged for manual ownership checks. It is never assigned to an arbitrary user.
 
 ## Install Firewall
 #### To install Firewall follow instructoins
@@ -134,23 +243,23 @@ While still in root user on your VPS (or alternatively you can sudo within your 
 
 ## How to install Firo Wallet/Node on Ubuntu
 
-#### Download and unzip last release 
+#### Download and unpack Firo Core 0.14.18.0 or newer
 
-<code>wget https://github.com/firoorg/firo/releases/download/v0.14.6.0/firo-0.14.6.0-linux64.tar.gz | tar -xvf</code>
+Use the current Linux release from https://github.com/firoorg/firo/releases.
 
 #### Send files to binary folder
 
-<code>cd firo-0.14.6; cp bin/* /usr/local/bin</code>
+<code>cd firo-&lt;version&gt;; cp bin/* /usr/local/bin</code>
 
 #### Create config file
-nano /root/.firo/firo.config
+<pre>nano /root/.firo/firo.conf</pre>
 
 <pre>
 #----
 rpcuser=user
 rpcpassword=password
 rpcallowip=127.0.0.1
-rpcport=8332
+rpcport=8888
 #----
 listen=1
 server=1
@@ -335,6 +444,6 @@ spendzerocoin amount(1,10,25,50,100) ("firoaddress")
 
 #### Curl Request 
 
-<code>curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getbalance"}' http://user:password@127.0.0.1:8332</code>
+<code>curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getbalance"}' http://user:password@127.0.0.1:8888</code>
 
-<code> curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressbalance", "params": [{"addresses": ["XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg"]}] }' -H 'content-type: text/plain;' http://user:password@127.0.0.1:8332</code>
+<code> curl --data-binary '{"jsonrpc": "1.0", "id":"curltest", "method": "getaddressbalance", "params": [{"addresses": ["XwnLY9Tf7Zsef8gMGL2fhWA9ZmMjt4KPwg"]}] }' -H 'content-type: text/plain;' http://user:password@127.0.0.1:8888</code>
